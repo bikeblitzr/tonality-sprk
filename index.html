@@ -190,8 +190,11 @@ hr{border:0;border-top:1px solid var(--line);margin:34px 0}
 .tiny{font-size:12.5px}
 .tinier{font-size:11.5px}
 
-input[type=text],input[type=number],input[type=search],select,textarea{
+input[type=text],input[type=number],input[type=search],input[type=password],
+input[type=email],input[type=tel],select,textarea{
   background:var(--plane);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font-size:14px;width:100%}
+/* labelled field: the label always sits above its control */
+.f .lbl{display:block;margin-bottom:5px}
 input:focus,select:focus,textarea:focus{outline:2px solid var(--acc);outline-offset:-1px;border-color:transparent}
 textarea{resize:vertical;line-height:1.55;min-height:80px}
 select{cursor:pointer;-webkit-appearance:none;appearance:none;padding-right:30px;

@@ -2788,9 +2788,28 @@ var listeners=[];
 /* rolling capture */
 var frames=[];         // {t, f0, rms, db, voiced}
 var chunks=[];         // Float32 audio for playback
+var specFrames=[];     // {t, db, mags:Float32Array}  — only while grabSpectra
+var grabSpectra=false;
 var t0=0;
 var lastErr=null;
 var micState='idle';   // idle | live | denied | error
+
+/* ---------- speaker profile ----------
+   Set from calibration. Narrows the pitch-tracker search window (the
+   single biggest source of octave errors), gives the VAD a real room
+   noise floor, and supplies personal stretch bands.                */
+var PROFILE=null;
+function setProfile(p){ PROFILE = (p && p.done) ? p : null; }
+function getProfile(){ return PROFILE; }
+
+/* search bounds — wide by default, narrow once we know the speaker */
+function bounds(){
+  if(!PROFILE || !PROFILE.lowHz || !PROFILE.highHz) return {lo:60, hi:900};
+  return {
+    lo: Math.max(50,  Math.min(160, PROFILE.lowHz  * 0.72)),
+    hi: Math.max(240, Math.min(900, PROFILE.highHz * 1.55))
+  };
+}
 
 /* ---------- helpers ---------- */
 function hzToSt(hz, ref){ return 12*Math.log2(hz/ref); }
@@ -2810,8 +2829,9 @@ function detectPitch(buf, sr){
   rms=Math.sqrt(rms/n);
   if(rms<0.006) return -1;
 
-  var maxLag=Math.floor(sr/60);      // 60 Hz floor
-  var minLag=Math.floor(sr/900);     // 900 Hz ceiling
+  var B=bounds();
+  var maxLag=Math.floor(sr/B.lo);
+  var minLag=Math.floor(sr/B.hi);
   if(maxLag>n-1) maxLag=n-1;
 
   var nsdf=new Float32Array(maxLag+1);
@@ -2847,7 +2867,7 @@ function detectPitch(buf, sr){
   for(j=0;j<peaks.length;j++){
     if(peaks[j].val>=thresh){
       var f=sr/peaks[j].lag;
-      if(f>=60 && f<=900) return f;
+      if(f>=B.lo && f<=B.hi) return f;
       return -1;
     }
   }
@@ -2859,10 +2879,16 @@ function smoothF0(arr){
   var out=arr.slice();
   var vals=arr.filter(function(v){return v>0;});
   if(vals.length<6) return out;
-  var med=median(vals);
+  // anchor on the speaker's known modal F0 when we have one — a short
+  // utterance's own median is a shaky reference, the profile's is not
+  var med = median(vals);
+  if(PROFILE && PROFILE.modalHz){
+    var drift = Math.abs(12*Math.log2(med/PROFILE.modalHz));
+    if(drift < 7) med = med*0.4 + PROFILE.modalHz*0.6;
+  }
   for(var i=0;i<out.length;i++){
     if(out[i]<=0) continue;
-    // fix octave jumps against the running median
+    // fix octave jumps against the reference
     if(out[i] > med*1.7) out[i]/=2;
     else if(out[i] < med*0.58) out[i]*=2;
   }
@@ -2895,6 +2921,7 @@ function start(){
     source=ctx.createMediaStreamSource(stream);
     analyser=ctx.createAnalyser();
     analyser.fftSize=BUF; analyser.smoothingTimeConstant=0;
+    analyser.minDecibels=-95; analyser.maxDecibels=-12;
     gain=ctx.createGain(); gain.gain.value=0;
     proc=ctx.createScriptProcessor(BUF,1,1);
     source.connect(analyser);
@@ -2950,12 +2977,30 @@ function onAudio(ev){
     frames.push({t:t, f0:f0, rms:rms, db:db, voiced:f0>0 && db>-52});
     var c=new Float32Array(n); c.set(buf); chunks.push(c);
     if(frames.length>24000){ frames.shift(); chunks.shift(); }
+
+    // full-resolution spectrum, only during calibration steps that need it
+    if(grabSpectra && analyser && specFrames.length<900){
+      var fb=new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(fb);
+      var lin=new Float32Array(fb.length);
+      var mn=analyser.minDecibels, mx=analyser.maxDecibels;
+      for(i=0;i<fb.length;i++){
+        // byte 0..255 maps linearly across [minDecibels, maxDecibels] — undo it
+        var dbv = mn + (fb[i]/255)*(mx-mn);
+        lin[i] = fb[i]>0 ? Math.pow(10, dbv/20) : 0;
+      }
+      specFrames.push({t:t, db:db, mags:lin});
+    }
   }
 }
 
 /* ---------- capture control ---------- */
-function beginCapture(){ frames=[]; chunks=[]; t0=performance.now(); capturing=true; }
-function endCapture(){ capturing=false; return analyse(); }
+function beginCapture(opts){
+  frames=[]; chunks=[]; specFrames=[];
+  grabSpectra = !!(opts && opts.spectra);
+  t0=performance.now(); capturing=true;
+}
+function endCapture(){ capturing=false; grabSpectra=false; return analyse(); }
 function isCapturing(){ return capturing; }
 function live(){ return {f0:liveF0, db:liveDb, rms:liveRms, spec:specBins, elapsed: capturing?(performance.now()-t0)/1000:0}; }
 function liveFrames(){ return frames; }
@@ -3071,6 +3116,176 @@ function analyse(){
   };
 }
 
+/* ============================================================
+   CALIBRATION ANALYSES
+   ============================================================ */
+
+/* --- step 1: room noise floor --- */
+function analyseNoise(){
+  var raw=frames.slice();
+  if(raw.length<8) return null;
+  var dbs=raw.map(function(f){return f.db;});
+  var floorDb = pct(dbs,0.5);
+  var peakDb  = pct(dbs,0.97);
+  var verdict, ok;
+  if(floorDb < -62){ verdict='Very quiet. Ideal conditions.'; ok=true; }
+  else if(floorDb < -54){ verdict='Quiet enough. Nothing to worry about.'; ok=true; }
+  else if(floorDb < -46){ verdict='Some background noise. Workable, but the pause measurements will be a little softer than they could be.'; ok=true; }
+  else { verdict='Noisy. A fan, air conditioning, traffic or an open room. Pause and pace scores will be unreliable until it is quieter — move rooms or use a headset mic if you can.'; ok=false; }
+  return {floorDb:floorDb, peakDb:peakDb, verdict:verdict, ok:ok, spread:peakDb-floorDb};
+}
+
+/* --- step 2: sustained vowel — register, breath support, stability --- */
+function analyseSustain(){
+  var raw=frames.slice();
+  if(raw.length<10) return null;
+  var f0s=smoothF0(raw.map(function(f){return f.f0>0?f.f0:-1;}));
+  for(var i=0;i<raw.length;i++) raw[i].f0s=f0s[i];
+  var voiced=raw.filter(function(f){ return f.f0s>0 && f.db>-52; });
+  if(voiced.length<8) return {empty:true};
+
+  // longest continuous voiced run = maximum phonation time
+  var best=0, run=0, lastT=-1, frameDur = raw.length>1 ? (raw[raw.length-1].t-raw[0].t)/(raw.length-1) : 0.043;
+  for(i=0;i<raw.length;i++){
+    if(raw[i].f0s>0 && raw[i].db>-52){ run+=frameDur; if(run>best) best=run; }
+    else run=0;
+  }
+  var hz=voiced.map(function(f){return f.f0s;});
+  var modal=median(hz);
+  // stability: semitone standard deviation across the sustain
+  var sts=hz.map(function(h){ return hzToSt(h, modal); });
+  var m=mean(sts);
+  var sd=Math.sqrt(mean(sts.map(function(s){ return (s-m)*(s-m); })));
+  return {modalHz:modal, mpt:best, steadiness:sd, frames:voiced.length};
+}
+
+/* --- step 3: pitch glide — usable range --- */
+function analyseGlide(){
+  var raw=frames.slice();
+  if(raw.length<10) return null;
+  // glide search must be wide — this is what SETS the bounds, so ignore any profile
+  var saved=PROFILE; PROFILE=null;
+  var f0s=smoothF0(raw.map(function(f){return f.f0>0?f.f0:-1;}));
+  PROFILE=saved;
+  for(var i=0;i<raw.length;i++) raw[i].f0s=f0s[i];
+  var voiced=raw.filter(function(f){ return f.f0s>0 && f.db>-50; });
+  if(voiced.length<10) return {empty:true};
+  var hz=voiced.map(function(f){return f.f0s;});
+  // 5th/95th percentile, not min/max — endpoints are where tracking is worst
+  var lo=pct(hz,0.05), hi=pct(hz,0.95);
+  var mid=median(hz);
+  return {lowHz:lo, highHz:hi, midHz:mid, semitones: hzToSt(hi, lo), frames:voiced.length};
+}
+
+/* --- spectral centre of gravity over a band ---
+   A naive magnitude centroid is badly biased: every fricative has broad
+   skirts, and whichever side of the measurement band has more room to
+   spread drags the answer toward the band's middle. That compresses the
+   /s/-to-/ʃ/ ratio, which is exactly the number we care about — so a
+   plain centroid would produce false "compressed separation" readings on
+   perfectly normal speakers.
+   Two corrections: gate to bins near the peak (kills the skirts), and
+   weight by power rather than amplitude (sharpens what's left).      */
+function cog(mags, sr, loHz, hiHz, gateFrac){
+  var nyq=sr/2, n=mags.length, i;
+  var i0=Math.max(1, Math.floor(loHz/nyq*n)), i1=Math.min(n-1, Math.ceil(hiHz/nyq*n));
+  if(i1<=i0) return 0;
+  var peak=0;
+  for(i=i0;i<=i1;i++) if(mags[i]>peak) peak=mags[i];
+  if(peak<=0) return 0;
+  var gate=peak*(gateFrac==null?0.45:gateFrac);
+  var num=0, den=0;
+  for(i=i0;i<=i1;i++){
+    var m=mags[i];
+    if(m<gate) continue;
+    var p=m*m;
+    num += (i/n*nyq)*p; den += p;
+  }
+  return den>0 ? num/den : 0;
+}
+
+/* --- step 4: sibilants.  "sssss … shhhhh" in one capture ---
+   Measures the spectral centre of gravity of each fricative and, more
+   importantly, the SEPARATION between them. Absolute COG scales with
+   vocal-tract length; the ratio does not, so the ratio is the honest
+   number and the one we report against.                              */
+function analyseSibilants(){
+  if(specFrames.length<10) return null;
+  var raw=frames.slice();
+  if(raw.length<10) return null;
+
+  var dbs=raw.map(function(f){return f.db;});
+  var gate=Math.max(pct(dbs,0.92)-22, pct(dbs,0.1)+8, -58);
+
+  // segment into voiced/noisy regions on the same gate the VAD uses
+  var segs=[], cur=null;
+  for(var i=0;i<raw.length;i++){
+    if(raw[i].db>gate){ if(!cur) cur={s:raw[i].t,e:raw[i].t}; else cur.e=raw[i].t; }
+    else if(cur){ segs.push(cur); cur=null; }
+  }
+  if(cur) segs.push(cur);
+  var merged=[];
+  segs.forEach(function(s){
+    if(merged.length && s.s-merged[merged.length-1].e < 0.15) merged[merged.length-1].e=s.e;
+    else merged.push({s:s.s,e:s.e});
+  });
+  segs = merged.filter(function(s){ return s.e-s.s > 0.25; });
+  if(segs.length<2) return {tooFew:true, segs:segs.length};
+
+  // take the two longest — trims throat clears and stray noise
+  segs.sort(function(a,b){ return (b.e-b.s)-(a.e-a.s); });
+  var two=segs.slice(0,2).sort(function(a,b){ return a.s-b.s; });
+
+  function segCog(seg){
+    var fs=specFrames.filter(function(f){
+      // trim 20% off each end — the transitions in and out aren't the fricative
+      var pad=(seg.e-seg.s)*0.2;
+      return f.t>=seg.s+pad && f.t<=seg.e-pad;
+    });
+    if(fs.length<3) return null;
+    var n=fs[0].mags.length, acc=new Float32Array(n);
+    fs.forEach(function(f){ for(var k=0;k<n;k++) acc[k]+=f.mags[k]; });
+    for(var k=0;k<n;k++) acc[k]/=fs.length;
+    return { cog: cog(acc, SR, 1500, 11000), frames:fs.length, dur:seg.e-seg.s };
+  }
+
+  var A=segCog(two[0]), B=segCog(two[1]);
+  if(!A || !B) return {tooFew:true, segs:segs.length};
+
+  // whichever is higher is /s/, the other /ʃ/ — order-independent, so it
+  // still works if someone says them the other way round
+  var s  = A.cog >= B.cog ? A : B;
+  var sh = A.cog >= B.cog ? B : A;
+  var ratio = sh.cog>0 ? s.cog/sh.cog : 0;
+
+  var verdict, flag;
+  if(ratio >= 1.55){
+    verdict='Clear separation between your /s/ and /ʃ/. Nothing to work on here.'; flag='ok';
+  } else if(ratio >= 1.3){
+    verdict='Slightly compressed separation. Common, usually just a soft /s/ — the sibilant rack in Articulation sharpens it.'; flag='soft';
+  } else {
+    verdict='Your /s/ and /ʃ/ are sitting very close together. That can mean a soft or fronted /s/, or simply that the two sounds ran into each other in the recording. It is worth re-running this step to check, and if it holds, the sibilant rack is the drill that targets it.'; flag='close';
+  }
+  return {
+    sHz:s.cog, shHz:sh.cog, ratio:ratio, verdict:verdict, flag:flag,
+    sDur:s.dur, shDur:sh.dur
+  };
+}
+
+/* --- step 5: natural speech baseline --- */
+function analyseNatural(a, wordCount){
+  if(!a || a.empty) return null;
+  return {
+    wpm: wpm(a, wordCount),
+    span: a.span,
+    term: a.term,
+    dyn: a.dyn,
+    pauseFrac: a.pauseFrac,
+    floorDrop: a.floorDrop,
+    baseHz: a.baseline
+  };
+}
+
 /* ---------- rate ---------- */
 function wpm(a, wordCount){
   if(!a || !a.speechTime || !wordCount) return 0;
@@ -3089,9 +3304,57 @@ function bandScore(v, band, tolerance){
   return clamp(1 - d/tol, 0, 1);
 }
 
-function scoreAgainstTone(a, tone, wordCount){
+/* ---------- personal stretch bands ----------
+   Derived from calibration. Deliberately set ABOVE the person's natural
+   habit — the point is to stretch them past where they already sit, not
+   to lower the bar to meet them. Terminal is never personalised: a fall
+   is a fall, that's physics rather than physiology.                    */
+function personalBands(tone){
+  var P=PROFILE;
+  if(!P || !P.natural) return null;
+  var N=P.natural, T=tone.target;
+  function shift(band, natural, stretch, floor, ceil){
+    if(natural==null) return band;
+    var mid=(band[0]+band[1])/2;
+    // move the standard band a third of the way toward this speaker's
+    // own habit, then push it up by the stretch factor
+    var lo = band[0] + (natural-mid)*0.33;
+    var hi = band[1] + (natural-mid)*0.33;
+    lo*=stretch; hi*=stretch;
+    return [Math.max(floor, +lo.toFixed(1)), Math.min(ceil, +hi.toFixed(1))];
+  }
+  return {
+    wpm:  shift(T.wpm,  N.wpm,  1,    70,  240),
+    span: shift(T.span, N.span, 1.12, 3.5, 18),
+    term: T.term,
+    dyn:  shift(T.dyn,  N.dyn,  1.08, 2,   20),
+    pause:shift(T.pause,N.pauseFrac, 1.05, 5, 55)
+  };
+}
+
+/* how far this rep sits above the speaker's own calibration baseline */
+function vsBaseline(a, W){
+  var P=PROFILE;
+  if(!P || !P.natural) return null;
+  var N=P.natural, out=[];
+  if(N.span!=null)  out.push({k:'Range',    d:a.span - N.span,        u:'st', better:'up'});
+  if(N.dyn!=null)   out.push({k:'Dynamics', d:a.dyn  - N.dyn,         u:'dB', better:'up'});
+  if(N.term!=null)  out.push({k:'Terminal', d:N.term - a.term,        u:'st', better:'up'});
+  if(N.pauseFrac!=null) out.push({k:'Silence', d:a.pauseFrac-N.pauseFrac, u:'%', better:'up'});
+  if(N.floorDrop!=null) out.push({k:'Held to end', d:N.floorDrop-a.floorDrop, u:'dB', better:'up'});
+  return out.map(function(x){
+    x.d = +x.d.toFixed(1);
+    x.good = x.d > 0.4;
+    return x;
+  });
+}
+
+function scoreAgainstTone(a, tone, wordCount, usePersonal){
   if(!a || a.empty) return null;
-  var T=tone.target, parts=[], faults=[], wins=[];
+  var std=tone.target;
+  var pers = personalBands(tone);
+  var T = (usePersonal && pers) ? pers : std;
+  var parts=[], faults=[], wins=[];
 
   var W=wpm(a, wordCount);
   var sW=bandScore(W, T.wpm, 42);
@@ -3137,7 +3400,12 @@ function scoreAgainstTone(a, tone, wordCount){
   if(a.floorDrop>6) score=Math.max(0,score-7);
   if(a.span<3) score=Math.max(0,score-8);
 
-  return {score:score, parts:parts, faults:faults, wins:wins, wpm:W};
+  return {
+    score:score, parts:parts, faults:faults, wins:wins, wpm:W,
+    personalised: !!(usePersonal && pers),
+    hasPersonal: !!pers,
+    vsBase: vsBaseline(a, W)
+  };
 }
 
 /* ---------- targeted scorers ---------- */
@@ -3290,6 +3558,10 @@ return {
   start:start, stop:stop, ready:ready, state:state, error:error, on:on,
   beginCapture:beginCapture, endCapture:endCapture, isCapturing:isCapturing,
   live:live, liveFrames:liveFrames, analyse:analyse,
+  setProfile:setProfile, getProfile:getProfile, bounds:bounds,
+  analyseNoise:analyseNoise, analyseSustain:analyseSustain, analyseGlide:analyseGlide,
+  analyseSibilants:analyseSibilants, analyseNatural:analyseNatural,
+  personalBands:personalBands, vsBaseline:vsBaseline, cog:cog,
   wpm:wpm, scoreAgainstTone:scoreAgainstTone, scoreTerminal:scoreTerminal,
   scorePace:scorePace, scoreRange:scoreRange, scoreFloor:scoreFloor, scorePauses:scorePauses,
   contourTrace:contourTrace, scoreContour:scoreContour,
@@ -3332,8 +3604,15 @@ var S = (function(){
     ach:{}, day:1, dayDone:{},
     streak:0, lastDay:null, bestStreak:0,
     hist:[],           // {ts, tone, score, wpm, span, term}
-    prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true},
+    prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true,
+           personalTargets:false},
     counters:{warmups:0, perfect:0, floorStreak:0, twCleared:0, gauntlets:0, gauntletBest:0, scripts:0},
+    /* voice profile from calibration — see Audio.setProfile */
+    profile:{done:false, at:null, noiseDb:null, modalHz:null, mpt:null, steadiness:null,
+             lowHz:null, highHz:null, semitones:null,
+             sibilant:null,   // {sHz, shHz, ratio, flag}
+             natural:null,    // {wpm, span, term, dyn, pauseFrac, floorDrop, baseHz}
+             history:[]},     // past calibrations, for drift
     firstSeen:null
   };
   var s = Store.get() || JSON.parse(JSON.stringify(def));
@@ -3341,6 +3620,8 @@ var S = (function(){
   (function fill(t,d){ for(var k in d){ if(!(k in t)) t[k]=JSON.parse(JSON.stringify(d[k]));
     else if(d[k] && typeof d[k]==='object' && !Array.isArray(d[k])) fill(t[k],d[k]); } })(s,def);
   if(!s.firstSeen) s.firstSeen=Date.now();
+  // hand the saved voice profile to the audio engine before anything records
+  if(s.profile && s.profile.done) Audio.setProfile(s.profile);
 
   function save(){ Store.set(s); }
   function today(){ var d=new Date(); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate(); }
@@ -3402,7 +3683,8 @@ var S = (function(){
       s.hist.push({ts:Date.now(), tone:toneId, score:score,
         wpm: extra&&extra.wpm?Math.round(extra.wpm):null,
         span: extra&&extra.span!=null?+extra.span.toFixed(1):null,
-        term: extra&&extra.term!=null?+extra.term.toFixed(1):null});
+        term: extra&&extra.term!=null?+extra.term.toFixed(1):null,
+        baseHz: extra&&extra.baseHz?Math.round(extra.baseHz):null});
       if(s.hist.length>900) s.hist=s.hist.slice(-900);
       if(score>=95){ s.counters.perfect++; }
       if(extra && extra.floorDrop!=null){
@@ -3504,6 +3786,38 @@ var S = (function(){
     };
   }
 
+  /* ---------- voice profile ---------- */
+  function saveProfile(p){
+    var old=s.profile;
+    if(old && old.done){
+      s.profile.history = (old.history||[]).concat([{
+        at:old.at, modalHz:old.modalHz, lowHz:old.lowHz, highHz:old.highHz,
+        mpt:old.mpt, natural:old.natural, sibilant:old.sibilant
+      }]).slice(-8);
+    }
+    var hist=s.profile.history||[];
+    s.profile=Object.assign({}, s.profile, p, {done:true, at:Date.now(), history:hist});
+    Audio.setProfile(s.profile);
+    save();
+    return s.profile;
+  }
+  function profile(){ return s.profile && s.profile.done ? s.profile : null; }
+  function clearProfile(){
+    s.profile={done:false, at:null, noiseDb:null, modalHz:null, mpt:null, steadiness:null,
+               lowHz:null, highHz:null, semitones:null, sibilant:null, natural:null,
+               history:s.profile.history||[]};
+    Audio.setProfile(null); save();
+  }
+  /* has their voice drifted far enough from the profile to be worth re-running? */
+  function profileDrift(){
+    var p=profile(); if(!p || !p.modalHz) return null;
+    var recent=s.hist.slice(-15).filter(function(h){ return h.baseHz; });
+    if(recent.length<8) return null;
+    var med=recent.map(function(h){return h.baseHz;}).sort(function(a,b){return a-b;})[Math.floor(recent.length/2)];
+    var st=12*Math.log2(med/p.modalHz);
+    return Math.abs(st) > 3.5 ? {st:+st.toFixed(1), measured:Math.round(med), profile:Math.round(p.modalHz)} : null;
+  }
+
   function reset(){ Store.clear(); location.reload(); }
   function exportJson(){ return JSON.stringify(s,null,2); }
   function importJson(txt){
@@ -3514,6 +3828,7 @@ var S = (function(){
   return {
     raw:function(){return s;}, save:save, level:level, levelProgress:levelProgress,
     addXp:addXp, recordRep:recordRep, masteryOf:masteryOf, rawMastery:rawMastery,
+    saveProfile:saveProfile, profile:profile, clearProfile:clearProfile, profileDrift:profileDrift,
     weakQueue:weakQueue, tierUnlocked:tierUnlocked, tierNeed:tierNeed,
     grant:grant, checkAch:checkAch, noteMetric:noteMetric, stats:stats, touchDay:touchDay,
     reset:reset, exportJson:exportJson, importJson:importJson, today:today
@@ -3838,6 +4153,17 @@ $('#settingsBtn').onclick=function(){
      '<span><b>Auto-advance</b><br><span class="dim tiny">Move to the next item automatically after a scored rep.</span></span></label>'+
    '<label class="ck" style="margin-bottom:16px"><input type="checkbox" id="setNums"'+(s.prefs.showNums?' checked':'')+'>'+
      '<span><b>Show live numbers</b><br><span class="dim tiny">Live pitch and level readouts during recording. Turn off if it distracts you.</span></span></label>'+
+   '<hr><p class="lbl" style="margin-bottom:10px">Your voice</p>'+
+   (S.profile()
+     ? '<p class="tiny dim2" style="margin-bottom:10px">Calibrated — modal pitch <b class="mono">'+Math.round(S.profile().modalHz||0)+' Hz</b>, '+
+       'range <b class="mono">'+Math.round(S.profile().lowHz||0)+'–'+Math.round(S.profile().highHz||0)+' Hz</b>.</p>'+
+       '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setPersonal"'+(s.prefs.personalTargets?' checked':'')+'>'+
+       '<span><b>Personal Mode</b><br><span class="dim tiny">Scores against bands stretched from <em>your</em> calibration instead of the fixed research-backed ones. '+
+       'More encouraging early on — but scores stop being comparable between people, so leave it off if you are tracking a team. '+
+       'The “vs your baseline” readout appears either way.</span></span></label>'
+     : '<p class="tiny dim2" style="margin-bottom:10px">Not calibrated yet. Two minutes, and every score afterwards is measured more accurately.</p>')+
+   '<div class="row" style="margin-bottom:16px"><button class="btn sec sm" id="calBtn">'+(S.profile()?'Re-run calibration':'Calibrate my voice')+'</button>'+
+   (S.profile()?'<button class="btn gh sm" id="calClear">Clear profile</button>':'')+'</div>'+
    '<hr><p class="lbl" style="margin-bottom:8px">Your data</p>'+
    '<div class="row"><button class="btn sec sm" id="expBtn">Export progress</button>'+
    '<button class="btn sec sm" id="impBtn">Import</button>'+
@@ -3847,6 +4173,17 @@ $('#settingsBtn').onclick=function(){
   $('#setHard').onchange=function(){ s.prefs.hardMode=this.checked; S.save(); };
   $('#setAuto').onchange=function(){ s.prefs.autoNext=this.checked; S.save(); };
   $('#setNums').onchange=function(){ s.prefs.showNums=this.checked; S.save(); };
+  if($('#setPersonal')) $('#setPersonal').onchange=function(){
+    s.prefs.personalTargets=this.checked; S.save();
+    toast(this.checked ? 'Personal Mode <b>on</b> — scores are no longer comparable between people'
+                       : 'Personal Mode <b>off</b> — back to the fixed standard');
+  };
+  $('#calBtn').onclick=function(){ closeModal(); needMic().then(function(ok){ if(ok) Drill.launch('calibrate','redo'); }); };
+  if($('#calClear')) $('#calClear').onclick=function(){
+    if(confirm('Clear your voice profile? The pitch tracker goes back to searching the full range for everyone, and the "vs your baseline" readouts disappear.')){
+      S.clearProfile(); closeModal(); render();
+    }
+  };
   $('#expBtn').onclick=function(){
     var b=new Blob([S.exportJson()],{type:'application/json'});
     var u=URL.createObjectURL(b), a=document.createElement('a');
@@ -3899,6 +4236,8 @@ return {
 'use strict';
 
 var MODULES = [
+{id:'calibrate',ic:'◎', n:'Voice Calibration',  c:'var(--cy)',  tier:1, mins:2,
+ d:'Five short steps that teach the app your voice. Room noise floor, your register and breath support, your usable pitch range, your articulation baseline and your natural speaking habits. Every score after this is measured more accurately because of it. Run it once, re-run it whenever something changes.'},
 {id:'warmup',   ic:'♨', n:'The Warmup',        c:'var(--ok)',  tier:1, mins:6,
  d:'Fourteen steps, in order. Straw phonation, lip trills, hum, the DDK racks, breath benchmark. Six minutes. Do it before everything else — it is the difference between practising your voice and practising your tired voice.'},
 {id:'tonelab',  ic:'◐', n:'Tone Lab',           c:'var(--acc)', tier:1, mins:8,
@@ -4042,7 +4381,7 @@ function wireRecorder(onDone, opts){
   function begin(){
     if(!Audio.ready()){ UI.needMic().then(function(ok){ if(ok){ startScope(opts.baseline); begin(); } }); return; }
     recording=true;
-    Audio.beginCapture();
+    Audio.beginCapture({spectra: !!opts.spectra});
     rec.textContent='■ Stop'; rec.classList.remove('sec');
     $('#ovLeft').textContent='recording';
     $('#recNote').textContent='';
@@ -4080,6 +4419,21 @@ function playback(){
 }
 
 /* ---------------- utility ---------------- */
+/* "vs your baseline" strip — always shown when a profile exists, alongside
+   the standard score rather than instead of it. Two honest numbers. */
+function baselineStrip(r){
+  if(!r || !r.vsBase || !r.vsBase.length) return '';
+  return '<div style="margin:12px 0 0">'+
+    '<p class="lbl" style="margin-bottom:7px;color:var(--cy)">vs your calibration baseline</p>'+
+    '<div class="readout">'+r.vsBase.map(function(x){
+      var sign = x.d>0?'+':'';
+      return '<div class="ro '+(x.good?'good':'')+'" style="'+(x.good?'':'opacity:.75')+'">'+
+        '<p class="k">'+esc(x.k)+'</p>'+
+        '<div class="v" style="font-size:17px">'+sign+x.d+'<span class="u">'+esc(x.u)+'</span></div>'+
+        '<p class="t">'+(x.good?'above your baseline':x.d<-0.4?'below it':'about the same')+'</p></div>';
+    }).join('')+'</div></div>';
+}
+
 function toneChip(t){ return '<span class="tone">'+esc(t.name)+'</span>'; }
 function cueBlock(t, extra){
   return '<div class="cue">'+toneChip(t)+
@@ -4097,6 +4451,272 @@ function targetPills(t){
    '<span class="pill">'+T.pause[0]+'–'+T.pause[1]+'% silence</span></div>';
 }
 function unlockedTones(){ return TONES.filter(function(t){ return S.tierUnlocked(t.tier); }); }
+
+/* ============================================================
+   MODE: VOICE CALIBRATION
+   Teaches the engine this specific voice and this specific room.
+   ============================================================ */
+var CAL_NATURAL = 'The meeting is on Thursday morning, and I told them we would have the numbers ready by then.';
+var CAL_SIBILANT = 'Say a long "ssssss" for about two seconds. Then pause. Then a long "shhhhh" for about two seconds.';
+
+function mCalibrate(arg){
+  var isRedo = arg==='redo';
+  var R = {};   // results accumulate here
+  var STEPS = [
+    {id:'intro'},
+    {id:'noise'}, {id:'sustain'}, {id:'glide'}, {id:'sibilant'}, {id:'natural'},
+    {id:'done'}
+  ];
+  D={i:0};
+  open('Voice Calibration', STEPS.length-2);
+
+  function draw(){
+    var st=STEPS[D.i];
+    if(!st) return finish();
+    ({intro:sIntro, noise:sNoise, sustain:sSustain, glide:sGlide,
+      sibilant:sSibilant, natural:sNatural, done:finish})[st.id]();
+    D.total = STEPS.length-2;
+    D.i2 = Math.max(0, D.i-1);
+    $('#stPos').textContent = (st.id==='intro'||st.id==='done') ? '' : (D.i)+' / 5';
+    $('#stProg').style.width = ((D.i)/(STEPS.length-1)*100)+'%';
+  }
+  D.next=function(){ D.i++; draw(); };
+  D.prev=function(){ if(D.i>0){ D.i--; draw(); } };
+  D.restart=function(){ R={}; D.i=0; draw(); };
+
+  /* ---------- 0 · intro ---------- */
+  function sIntro(){
+    body('<div class="cue"><span class="tone">Before anything else</span></div>'+
+      '<h2 style="font-size:26px;letter-spacing:-.02em;margin:0 0 12px">Let the app hear your voice first.</h2>'+
+      '<p class="prose" style="margin-bottom:16px">Two minutes, five short steps. It is not a test and nothing here is scored.</p>'+
+      '<div class="note cy"><span class="l">What it actually fixes</span>'+
+      '<b>Your room.</b> Measuring the background noise means the app can tell your silences apart from your speech. Without it, a fan or an air conditioner gets counted as talking, and every pause and pace number goes soft.<br><br>'+
+      '<b>Your register.</b> The pitch tracker currently searches the entire human range for everyone. Knowing roughly where your voice sits lets it search a much narrower window, and a narrower window means far fewer octave errors. This is the single biggest accuracy gain available.<br><br>'+
+      '<b>Your habits.</b> Your natural pace, range and terminal tendency become the line you get measured against later — so you can see movement from your own starting point, not just against a fixed standard.</div>'+
+      '<div class="note"><span class="l">If you have an accent, a soft voice, a lisp or anything else</span>'+
+      'Good — that is exactly what this is for. Everything measured here is reported as a plain number against a typical range. '+
+      'It is a measurement, not a judgement, and nothing in it is treated as a fault.</div>'+
+      '<div class="row" style="margin-top:18px"><button class="btn big" id="calGo">Start →</button>'+
+      (isRedo?'<button class="btn gh" onclick="Drill.close()">Cancel</button>':
+              '<button class="btn gh" id="calSkip">Skip for now</button>')+'</div>');
+    hint('You can re-run this any time from Progress, or from the settings menu.');
+    foot('Start →', false);
+    $('#calGo').onclick=function(){ D.i++; draw(); };
+    if($('#calSkip')) $('#calSkip').onclick=function(){ close(); };
+    D.space=function(){ D.i++; draw(); };
+  }
+
+  /* ---------- shared step frame ---------- */
+  function step(n, title, instruction, note, extra){
+    body('<div class="cue"><span class="tone">Step '+n+' of 5</span>'+
+      '<span class="chip tiny">'+esc(title)+'</span></div>'+
+      '<p class="utter sm">'+instruction+'</p>'+
+      (note?'<div class="note cy" style="margin-bottom:14px"><span class="l">Why</span>'+note+'</div>':'')+
+      (extra||'')+
+      recPanel({h:130}));
+  }
+
+  /* ---------- 1 · room noise ---------- */
+  function sNoise(){
+    step(1,'Room noise',
+      'Say nothing at all. Just hit record and sit still for about four seconds.',
+      'This is the reference the app uses to tell your silence apart from your speech. It is the only measurement here that cannot be worked out from a recording of you talking.');
+    hint('Do not hold your breath — just breathe normally and stay quiet.');
+    foot('Next →');
+    wireRecorder(function(){
+      var r=Audio.analyseNoise();
+      if(!r){ $('#result').innerHTML='<div class="note no" style="margin-top:14px">Nothing captured. Try again.</div>'; return; }
+      R.noiseDb=r.floorDb;
+      $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
+        UI.readouts([
+          {k:'Noise floor', v:Math.round(r.floorDb), u:'dB', s:r.ok?1:0.25},
+          {k:'Loudest', v:Math.round(r.peakDb), u:'dB', s:0.7},
+          {k:'Spread', v:Math.round(r.spread), u:'dB', s:0.7}
+        ])+
+        '<div class="note '+(r.ok?'ok':'no')+'" style="margin-top:12px"><span class="l">'+(r.ok?'Good':'Worth fixing')+'</span>'+esc(r.verdict)+'</div>';
+      if(S.raw().prefs.autoNext && r.ok) setTimeout(function(){ if(D) D.next(); }, 1800);
+    }, {maxSec:5});
+  }
+
+  /* ---------- 2 · sustained vowel ---------- */
+  function sSustain(){
+    step(2,'Register & breath',
+      'Take a breath, then hold an <b>“ahh”</b> on one comfortable note for as long as you can. Do not push — comfortable, not loud.',
+      'Gives the app your modal pitch, which is the anchor for every semitone measurement afterwards. The length also benchmarks your breath support, which is what runs out when people trail off at the end of sentences.');
+    hint('Comfortable pitch, comfortable volume. Straining makes the number worse, not better.');
+    foot('Next →');
+    wireRecorder(function(){
+      var r=Audio.analyseSustain();
+      if(!r || r.empty){ $('#result').innerHTML='<div class="note no" style="margin-top:14px">No steady tone detected. Try again a little louder.</div>'; return; }
+      R.modalHz=r.modalHz; R.mpt=r.mpt; R.steadiness=r.steadiness;
+      var mptOk = r.mpt>=12, mptGood = r.mpt>=18;
+      $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
+        UI.readouts([
+          {k:'Your pitch', v:Math.round(r.modalHz), u:'Hz', s:1},
+          {k:'Held for', v:r.mpt.toFixed(1), u:'s', s:mptGood?1:mptOk?0.7:0.3},
+          {k:'Steadiness', v:r.steadiness.toFixed(2), u:'st sd', s:r.steadiness<1.2?1:0.5}
+        ])+
+        '<div class="note cy" style="margin-top:12px"><span class="l">Reading</span>'+
+        'Your modal pitch is <b>'+Math.round(r.modalHz)+' Hz</b>. For reference, adult male voices commonly sit around 110–120 Hz and adult female voices around 200–210 Hz — but there is a very wide normal range and where you sit is not better or worse, it is just your instrument.<br><br>'+
+        '<b>Breath support:</b> '+(mptGood?'Strong. Above eighteen seconds is good support — you should not be running out of air at the end of sentences.':
+          mptOk?'Solid. Twelve to eighteen seconds is a normal range. The volume-floor drill will still be worth doing.':
+          'Short. Under twelve seconds usually means the breath is running out before the sentence does, which is the most common cause of trailing off. The warmup rack and the volume-floor drill both target this directly.')+'</div>';
+      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2600);
+    }, {maxSec:26});
+  }
+
+  /* ---------- 3 · glide ---------- */
+  function sGlide(){
+    step(3,'Your range',
+      'On an <b>“ooo”</b> or a lip trill, slide from the lowest note you can comfortably make up to the highest, and back down. Two or three passes.',
+      'This sets the pitch tracker\'s search window. It currently searches the entire human range for every user, which is exactly what causes octave errors — hearing 110 Hz as 220, or the reverse. Narrowing it to your actual range is the biggest single accuracy improvement in the app.');
+    hint('Comfortable range only. Do not chase your extremes — the app wants your usable range, not your record.');
+    foot('Next →');
+    wireRecorder(function(){
+      var r=Audio.analyseGlide();
+      if(!r || r.empty || r.semitones<4){
+        $('#result').innerHTML='<div class="note no" style="margin-top:14px"><span class="l">Not enough movement</span>'+
+          'Less than four semitones of travel was detected. Try again and make the slide obvious — go properly low, then properly high.</div>'; return;
+      }
+      R.lowHz=r.lowHz; R.highHz=r.highHz; R.semitones=r.semitones;
+      var b={lo:Math.max(50,Math.min(160,r.lowHz*0.72)), hi:Math.max(240,Math.min(900,r.highHz*1.55))};
+      $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
+        UI.readouts([
+          {k:'Low', v:Math.round(r.lowHz), u:'Hz', s:1},
+          {k:'High', v:Math.round(r.highHz), u:'Hz', s:1},
+          {k:'Range', v:r.semitones.toFixed(1), u:'st', s:r.semitones>=12?1:0.7},
+          {k:'Octaves', v:(r.semitones/12).toFixed(1), u:'', s:0.8}
+        ])+
+        '<div class="note ok" style="margin-top:12px"><span class="l">Tracker narrowed</span>'+
+        'Search window is now <b>'+Math.round(b.lo)+'–'+Math.round(b.hi)+' Hz</b> instead of 60–900. '+
+        'That is roughly a '+Math.round((1-(b.hi-b.lo)/840)*100)+'% narrower search, which means substantially fewer octave errors on every rep from here on — and it runs faster too.</div>';
+      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2600);
+    }, {maxSec:22});
+  }
+
+  /* ---------- 4 · sibilants ---------- */
+  function sSibilant(){
+    step(4,'Articulation',
+      'A long <b>“ssssss”</b> for two seconds. <span class="pz">⟨ pause ⟩</span> Then a long <b>“shhhhh”</b> for two seconds.',
+      'These two sounds are made a few millimetres apart in the mouth, and the distance between them is one of the clearest measurable markers of articulation precision. Leave a clear gap between them so the app can tell where one ends and the other begins.',
+      '<div class="note" style="margin-bottom:14px"><span class="l">Read this before you see the number</span>'+
+      'What comes back is a frequency measurement and nothing more. It is not a diagnosis, it cannot be one, and a browser is not qualified to make one. '+
+      'Accents, vocal tract size and microphone placement all move this number legitimately. If it flags something, the only thing that means is that the sibilant drills are worth your time.</div>');
+    hint('Steady and even. Do not run the two sounds together — the gap is what makes this measurable.');
+    foot('Next →');
+    wireRecorder(function(){
+      var r=Audio.analyseSibilants();
+      if(!r){ $('#result').innerHTML='<div class="note no" style="margin-top:14px">Nothing captured. Try again.</div>'; return; }
+      if(r.tooFew){
+        $('#result').innerHTML='<div class="note no" style="margin-top:14px"><span class="l">Could not separate the two sounds</span>'+
+          'The app needs two distinct stretches of sound with a clear gap between them. Try again: hold the "sss" for a full two seconds, stop completely for a beat, then hold the "shh" for two seconds.</div>';
+        return;
+      }
+      R.sibilant={sHz:r.sHz, shHz:r.shHz, ratio:r.ratio, flag:r.flag};
+      $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
+        UI.readouts([
+          {k:'/s/ centre', v:(r.sHz/1000).toFixed(1), u:'kHz', s:1},
+          {k:'/ʃ/ centre', v:(r.shHz/1000).toFixed(1), u:'kHz', s:1},
+          {k:'Separation', v:r.ratio.toFixed(2), u:'×', s:r.flag==='ok'?1:r.flag==='soft'?0.6:0.3}
+        ])+
+        '<div class="note '+(r.flag==='ok'?'ok':r.flag==='soft'?'':'cy')+'" style="margin-top:12px">'+
+        '<span class="l">What this number is</span>'+esc(r.verdict)+
+        '<br><br><span class="dim">The separation ratio is what matters rather than the absolute frequencies — absolute values shift with vocal tract size, so a larger person legitimately reads lower on both. Typical separation is around 1.6–2.2×.</span></div>'+
+        (r.flag!=='ok'?'<div class="row" style="margin-top:12px">'+
+          '<button class="btn sec sm" data-drill="twisters" data-arg="sib">Open the sibilant rack</button>'+
+          '<button class="btn gh sm" id="calRetry">Re-record this step</button></div>':'');
+      var rt=$('#calRetry'); if(rt) rt.onclick=function(){ D.redo(); };
+    }, {maxSec:9, spectra:true});
+  }
+
+  /* ---------- 5 · natural speech ---------- */
+  function sNatural(){
+    step(5,'How you actually talk',
+      esc(CAL_NATURAL),
+      'Read it the way you would say it to a colleague. Not performed, not careful — normal. This becomes your personal baseline, so a flat read here makes every later comparison look better than it is.');
+    hint('Normal voice. This is the one step where trying hard makes the measurement worse.');
+    foot('Finish →');
+    wireRecorder(function(a){
+      var n=Audio.analyseNatural(a, UI.words(CAL_NATURAL));
+      if(!n){ $('#result').innerHTML='<div class="note no" style="margin-top:14px">Nothing captured. Try again.</div>'; return; }
+      R.natural=n;
+      $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
+        UI.readouts([
+          {k:'Your pace', v:Math.round(n.wpm), u:'wpm', s:0.8},
+          {k:'Your range', v:n.span.toFixed(1), u:'st', s:0.8},
+          {k:'Your terminal', v:(n.term>0?'+':'')+n.term.toFixed(1), u:'st', s:0.8},
+          {k:'Your dynamics', v:n.dyn.toFixed(1), u:'dB', s:0.8},
+          {k:'Your silence', v:Math.round(n.pauseFrac), u:'%', s:0.8}
+        ])+
+        '<div class="note cy" style="margin-top:12px"><span class="l">Saved as your baseline</span>'+
+        'None of these are scores. They are where you naturally sit, and every rep from now on will show you how far you have moved from them.</div>';
+      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2400);
+    }, {maxSec:22});
+  }
+
+  /* ---------- done ---------- */
+  function finish(){
+    var p=S.saveProfile(R);
+    S.addXp(80, 'voice calibration');
+    var n=p.natural, sb=p.sibilant;
+    var b=Audio.bounds();
+
+    function row(k,v,note){
+      return '<div style="display:flex;justify-content:space-between;gap:14px;padding:9px 0;border-top:1px solid var(--line)">'+
+        '<span class="dim2" style="font-size:13.5px">'+k+'</span>'+
+        '<span style="text-align:right"><b class="mono" style="font-size:14px">'+v+'</b>'+
+        (note?'<br><span class="tiny dim">'+note+'</span>':'')+'</span></div>';
+    }
+
+    body('<div style="max-width:640px;margin:6px auto 0">'+
+      '<div class="cue"><span class="tone">Calibrated</span></div>'+
+      '<h2 style="font-size:27px;letter-spacing:-.025em;margin:0 0 8px">Your voice profile</h2>'+
+      '<p class="dim2" style="font-size:15px;margin-bottom:20px">Saved. The engine is now tuned to this voice and this room, and every score from here is measured against it.</p>'+
+
+      '<div class="card">'+
+      '<p class="lbl" style="margin-bottom:4px">The instrument</p>'+
+      (p.modalHz?row('Modal pitch', Math.round(p.modalHz)+' Hz', 'your resting note'):'')+
+      (p.lowHz?row('Usable range', Math.round(p.lowHz)+'–'+Math.round(p.highHz)+' Hz',
+        (p.semitones||0).toFixed(1)+' semitones · '+((p.semitones||0)/12).toFixed(1)+' octaves'):'')+
+      (p.mpt?row('Breath support', p.mpt.toFixed(1)+' s', p.mpt>=18?'strong':p.mpt>=12?'normal':'short — work the volume floor'):'')+
+      (sb?row('Sibilant separation', sb.ratio.toFixed(2)+'×',
+        Math.round(sb.sHz/100)/10+' kHz vs '+Math.round(sb.shHz/100)/10+' kHz'):'')+
+      (p.noiseDb!=null?row('Room noise floor', Math.round(p.noiseDb)+' dB', p.noiseDb<-54?'quiet':'some background'):'')+
+      '</div>'+
+
+      (n?'<div class="card" style="margin-top:12px">'+
+      '<p class="lbl" style="margin-bottom:4px">How you naturally speak</p>'+
+      row('Pace', Math.round(n.wpm)+' wpm', 'persuasive band is 148–174')+
+      row('Pitch range', n.span.toFixed(1)+' st', n.span<4?'under 4 reads as monotone':n.span<6?'a little narrow':'engaged')+
+      row('Terminal', (n.term>0?'+':'')+n.term.toFixed(1)+' st', n.term<-2?'you fall — good':n.term>1?'you tend to rise on statements':'you tend to end flat')+
+      row('Dynamics', n.dyn.toFixed(1)+' dB', n.dyn<4?'flat — most people are':'good variation')+
+      row('Silence', Math.round(n.pauseFrac)+'%', '15–25% is healthy')+
+      '</div>':'')+
+
+      '<div class="note ok" style="margin-top:14px"><span class="l">What changed under the hood</span>'+
+      'Pitch tracker now searches <b>'+Math.round(b.lo)+'–'+Math.round(b.hi)+' Hz</b> instead of 60–900. '+
+      'Octave-error correction is anchored to your modal pitch rather than to each utterance\'s own median. '+
+      'Every rep from here gets a second readout showing movement against these numbers.</div>'+
+
+      (n && n.term>-1 ?'<div class="note acc" style="margin-top:10px"><span class="l">Your first target</span>'+
+       'Your natural terminal is '+(n.term>1?'rising':'flat')+' at '+(n.term>0?'+':'')+n.term.toFixed(1)+' semitones. '+
+       'That is the highest-leverage single habit to change, and the Terminal Trainer exists for exactly it. Start there.</div>':'')+
+
+      (n && n.span<4.5 ?'<div class="note acc" style="margin-top:10px"><span class="l">Your first target</span>'+
+       'Your natural pitch range is '+n.span.toFixed(1)+' semitones. Under about four reads as monotone to a listener. '+
+       'The Monotone Killer widens it — and note the trick: widen the range while keeping your average pitch <em>low</em>. Most people raise their whole voice instead, which sounds anxious rather than engaged.</div>':'')+
+
+      '<div class="row" style="margin-top:20px">'+
+      '<button class="btn big" onclick="Drill.close();Drill.launch(\'warmup\')">Now do the warmup →</button>'+
+      '<button class="btn gh" onclick="Drill.close()">Done</button></div>'+
+      '<p class="tiny dim" style="margin-top:14px">Re-run this any time from Progress. Worth doing again if you change microphone or room, or if you are ill.</p>'+
+      '</div>');
+    hint(''); foot('Done', false);
+    D.next=close;
+  }
+
+  draw();
+}
 
 /* ============================================================
    MODE: WARMUP
@@ -4158,18 +4778,19 @@ function mToneLab(arg){
     hint('<b>Non-negotiable:</b> '+esc(t.recipe.terminal));
     foot(D.i===items.length-1?'Finish →':'Next →');
     wireRecorder(function(a){
-      var r=Audio.scoreAgainstTone(a, t, UI.words(it.l));
+      var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
       if(S.raw().prefs.hardMode) r.score=Math.max(0, Math.round(r.score*0.88));
-      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop});
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
       S.noteMetric('span', a.span); S.noteMetric('term', a.term);
       D.results.push({tone:t, score:r.score});
       $('#result').innerHTML=
         '<hr style="margin:20px 0 18px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score, t)+'</p>'+
-        '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · mastery on '+esc(t.name)+' now '+S.masteryOf(t.id)+'%</p></div></div>'+
-        UI.readouts(r.parts)+UI.faultList(r.faults, r.wins);
+        '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · mastery on '+esc(t.name)+' now '+S.masteryOf(t.id)+'%'+
+        (r.personalised?' · <span style="color:var(--cy)">personal bands</span>':'')+'</p></div></div>'+
+        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins);
       $('#recNote').textContent='Press R to redo, → for next.';
       if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
     }, {maxSec:22});
@@ -4668,9 +5289,9 @@ function mScript(arg){
     foot(D.i===sc.lines.length-1?'Finish →':'Next line →');
     setTimeout(function(){ var cur=UI.$('.ln.cur'); if(cur) cur.scrollIntoView({block:'center', behavior:'auto'}); },20);
     wireRecorder(function(a){
-      var r=Audio.scoreAgainstTone(a, t, UI.words(sc.lines[D.i][1]));
+      var r=Audio.scoreAgainstTone(a, t, UI.words(sc.lines[D.i][1]), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop});
+      S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
       D.results.push({score:r.score, tone:t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -4707,15 +5328,15 @@ function mRoulette(){
     var shown=false;
     document.onkeydown=null;
     wireRecorder(function(a){
-      var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.l));
+      var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(it.t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop});
+      S.recordRep(it.t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
       D.results.push({score:r.score, tone:it.t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3>'+
         '<p><b style="color:var(--ink)">Cue was:</b> '+esc(it.t.cue)+'</p></div></div>'+
-        UI.readouts(r.parts)+UI.faultList(r.faults.slice(0,2));
+        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults.slice(0,2));
       if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2600);
     }, {maxSec:16});
   }
@@ -4947,9 +5568,9 @@ function mCold(){
     hint('Do not read it silently first. Hit record and go. That is the drill.');
     foot(D.i===items.length-1?'Finish →':'Next →');
     wireRecorder(function(a){
-      var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.txt));
+      var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.txt), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(it.t.id, r.score, {wpm:r.wpm,span:a.span,term:a.term,floorDrop:a.floorDrop});
+      S.recordRep(it.t.id, r.score, {wpm:r.wpm,span:a.span,term:a.term,floorDrop:a.floorDrop,baseHz:a.baseline});
       D.results.push({score:r.score, tone:it.t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -5083,6 +5704,7 @@ function end(title, sub, name){
    launcher
    ============================================================ */
 var MODES={
+  calibrate:mCalibrate,
   warmup:mWarmup, tonelab:mToneLab, terminal:mTerminal, monotone:mMonotone,
   pace:mPace, pausegym:mPause, floor:mFloor, twisters:mTwisters,
   emphasis:mEmphasis, contour:mContour, script:mScript, roulette:mRoulette,
@@ -5138,6 +5760,13 @@ UI.registerView('home', function(){
     'Nothing here scores until the mic is on. Everything is processed locally in your browser — no audio is uploaded or stored anywhere. '+
     '<button class="btn sm" style="margin-left:8px" data-act="mic">Turn on the mic</button></div>';
 
+  var calWarn = S.profile() ? '' :
+    '<div class="note cy" style="margin-bottom:20px"><span class="l">Calibrate first</span>'+
+    '<b>Two minutes, five steps, nothing scored.</b> It measures your room\'s noise floor, your register, your usable pitch range and your natural speaking habits — '+
+    'then narrows the pitch tracker from the full human range down to yours. Every score you get afterwards is more accurate for it, and you get a baseline to measure movement against. '+
+    'Whatever your voice does — accent, register, a lisp, a soft voice — this is where the app learns it.'+
+    '<div style="margin-top:11px"><button class="btn sm" data-drill="calibrate">Calibrate my voice</button></div></div>';
+
   var todayMods = day.mods.map(function(id){
     return MODULES.filter(function(m){return m.id===id;})[0];
   }).filter(Boolean);
@@ -5149,7 +5778,7 @@ UI.registerView('home', function(){
     'Six minutes of mechanical warmup, then a single neutral sentence into the Tone Lab so the app can see where you actually are. Do not try to fix anything on day one.':
     esc(day.note))+'</p></div>'+
 
-  micWarn+
+  micWarn+ calWarn+
 
   '<div class="grid g4" style="margin-bottom:26px">'+
   '<div class="stat acc"><p class="k">Level</p><div class="v">'+p.lvl+'</div><p class="s">'+esc(p.rank)+'</p></div>'+
@@ -5581,6 +6210,53 @@ UI.registerView('path:act', function(a,arg){
   }
 });
 
+/* ---------- voice profile card ---------- */
+function profileCard(){
+  var p=S.profile();
+  if(!p){
+    return '<div class="sect" style="margin-top:0"><div class="card" style="border-color:var(--acc-line);background:var(--acc-wash)">'+
+      '<div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">'+
+      '<div style="flex:1;min-width:260px"><h3 style="font-size:17px;margin-bottom:5px">Your voice is not calibrated yet</h3>'+
+      '<p class="tiny dim2" style="margin:0">Two minutes, five steps, nothing scored. It measures your room noise floor, your register and breath support, your usable pitch range, your articulation and your natural speaking habits — '+
+      'and it narrows the pitch tracker from the full human range down to yours, which is the biggest single accuracy gain available.</p></div>'+
+      '<button class="btn" data-drill="calibrate">Calibrate now</button></div></div></div>';
+  }
+  var n=p.natural, sb=p.sibilant, b=Audio.bounds();
+  var drift=S.profileDrift();
+  function cell(k,v,s){ return '<div class="ro"><p class="k">'+esc(k)+'</p><div class="v" style="font-size:18px">'+v+'</div>'+
+    (s?'<p class="t">'+esc(s)+'</p>':'')+'</div>'; }
+  return '<div class="sect" style="margin-top:0"><div class="shead"><h2>Your voice profile</h2>'+
+  '<span class="n">calibrated '+new Date(p.at).toLocaleDateString()+'</span></div>'+
+  '<p class="sdesc">What the engine knows about your instrument and your room. Everything here is a measurement, not a grade.</p>'+
+  (drift?'<div class="note acc"><span class="l">Worth re-calibrating</span>'+
+    'Your recent reps are averaging <b>'+drift.measured+' Hz</b> against a profile of <b>'+drift.profile+' Hz</b> — that is '+
+    Math.abs(drift.st)+' semitones of drift. Different mic, different room, a cold, or just a different time of day. '+
+    'Re-running calibration takes two minutes and will sharpen every score.</div>':'')+
+  '<div class="readout">'+
+    (p.modalHz?cell('Modal pitch', Math.round(p.modalHz)+'<span class="u">Hz</span>','your resting note'):'')+
+    (p.lowHz?cell('Usable range', Math.round(p.lowHz)+'–'+Math.round(p.highHz),'Hz · '+(p.semitones||0).toFixed(1)+' st'):'')+
+    (p.mpt?cell('Breath', p.mpt.toFixed(1)+'<span class="u">s</span>', p.mpt>=18?'strong':p.mpt>=12?'normal':'short'):'')+
+    (sb?cell('Sibilant sep.', sb.ratio.toFixed(2)+'<span class="u">×</span>', 'typical 1.6–2.2'):'')+
+    (p.noiseDb!=null?cell('Room floor', Math.round(p.noiseDb)+'<span class="u">dB</span>', p.noiseDb<-54?'quiet':'some noise'):'')+
+    cell('Tracker', Math.round(b.lo)+'–'+Math.round(b.hi), 'Hz search window')+
+  '</div>'+
+  (n?'<div class="card" style="margin-top:12px"><p class="lbl" style="margin-bottom:10px">How you naturally speak — the line every rep is compared against</p>'+
+   '<div class="readout">'+
+   cell('Pace', Math.round(n.wpm)+'<span class="u">wpm</span>','persuasive 148–174')+
+   cell('Range', n.span.toFixed(1)+'<span class="u">st</span>', n.span<4?'reads monotone':n.span<6?'narrow':'engaged')+
+   cell('Terminal', (n.term>0?'+':'')+n.term.toFixed(1)+'<span class="u">st</span>', n.term<-2?'you fall':n.term>1?'you rise':'you end flat')+
+   cell('Dynamics', n.dyn.toFixed(1)+'<span class="u">dB</span>', n.dyn<4?'flat':'good')+
+   cell('Silence', Math.round(n.pauseFrac)+'<span class="u">%</span>','15–25% healthy')+
+   '</div></div>':'')+
+  (S.raw().prefs.personalTargets?'<div class="note cy" style="margin-top:12px"><span class="l">Personal Mode is on</span>'+
+   'Your scores are being measured against bands stretched from this profile rather than the fixed standard. '+
+   'That makes them more encouraging and <b>not comparable to anyone else\'s</b>. Turn it off in settings if you are tracking a team.</div>':'')+
+  '<div class="row" style="margin-top:12px">'+
+  '<button class="btn sec sm" data-drill="calibrate" data-arg="redo">Re-run calibration</button>'+
+  (p.history&&p.history.length?'<span class="tiny dim">'+p.history.length+' earlier calibration'+(p.history.length>1?'s':'')+' kept</span>':'')+
+  '</div></div>';
+}
+
 /* ============================================================ PROGRESS */
 UI.registerView('progress', function(){
   var s=S.raw(), st=S.stats(), p=S.levelProgress();
@@ -5600,7 +6276,9 @@ UI.registerView('progress', function(){
   '<div class="stat '+(st.avg100>=80?'ok':'')+'"><p class="k">Avg score</p><div class="v">'+(st.avg100!=null?Math.round(st.avg100):'—')+'</div><p class="s">last 100 reps</p></div>'+
   '</div>'+
 
-  (st.avgWpm!=null? '<div class="sect" style="margin-top:0"><div class="shead"><h2>Your averages</h2><span class="n">last 100 scored reps</span></div>'+
+  profileCard()+
+
+  (st.avgWpm!=null? '<div class="sect"><div class="shead"><h2>Your averages</h2><span class="n">last 100 scored reps</span></div>'+
   '<div class="readout">'+
   '<div class="ro '+(st.avgWpm>=130&&st.avgWpm<=185?'good':'warn')+'"><p class="k">Pace</p><div class="v">'+Math.round(st.avgWpm)+'<span class="u">wpm</span></div><p class="t">148–174 persuasive</p></div>'+
   '<div class="ro '+(st.avgSpan>=6?'good':st.avgSpan>=4?'warn':'bad')+'"><p class="k">Range</p><div class="v">'+(st.avgSpan!=null?st.avgSpan.toFixed(1):'—')+'<span class="u">st</span></div><p class="t">6–10 engaged</p></div>'+
@@ -5707,7 +6385,7 @@ document.documentElement.setAttribute('data-theme', pref==='light'?'light':'dark
 var h=location.hash.replace('#','');
 if(h) UI.go(h); else UI.render();
 
-// first-run welcome
+// first-run welcome → straight into calibration
 var s=S.raw();
 if(!s.reps && !s.seenIntro){
   s.seenIntro=1; S.save();
@@ -5719,14 +6397,14 @@ if(!s.reps && !s.seenIntro){
     '<div class="note acc" style="margin-top:16px"><span class="l">Three things before you start</span>'+
     '<b>1 · It needs the microphone.</b> Everything is processed locally in your browser using the Web Audio API. No audio is uploaded, stored on a server, or sent anywhere. Your progress lives in this browser only.<br><br>'+
     '<b>2 · Use headphones or a quiet room.</b> The pitch tracker is good but it is not magic. Background noise and speaker bleed will confuse it.<br><br>'+
-    '<b>3 · Start with the warmup.</b> Six minutes, mechanical, no scoring. It is the difference between practising your voice and practising your tired voice.</div>'+
+    '<b>3 · Calibrate first.</b> Two minutes, five short steps, nothing scored. It teaches the app your room and your voice — and everything you do afterwards is measured more accurately because of it.</div>'+
     '<div class="note cy" style="margin-top:10px"><span class="l">The one thing to know</span>'+
     'Confident speech has a <b>low mean pitch</b> and a <b>wide pitch range</b>. Most people flatten their voice to sound serious, which just sounds dead — '+
     'and raise their whole register to sound animated, which sounds anxious. Those are two independent dials. Learning to move them separately is the single fastest improvement available to almost anyone.</div>'+
     '<div class="row" style="margin-top:18px">'+
-    '<button class="btn" id="introMic">Turn on the mic &amp; start</button>'+
+    '<button class="btn" id="introMic">Turn on the mic &amp; calibrate</button>'+
     '<button class="btn gh" onclick="UI.closeModal()">Look around first</button></div>');
-    UI.$('#introMic').onclick=function(){ UI.closeModal(); UI.needMic().then(function(ok){ if(ok) Drill.launch('warmup'); }); };
+    UI.$('#introMic').onclick=function(){ UI.closeModal(); UI.needMic().then(function(ok){ if(ok) Drill.launch('calibrate'); }); };
   }, 500);
 }
 

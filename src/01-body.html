@@ -1,0 +1,55 @@
+<button id="railToggle" aria-label="Menu">☰</button>
+<div id="scrim"></div>
+
+<div id="shell">
+  <aside id="rail">
+    <div class="brand">
+      <div class="brandmark">
+        <svg width="17" height="17" viewBox="0 0 32 32" aria-hidden="true">
+          <g fill="currentColor" style="color:var(--acc)">
+            <rect x="2" y="13" width="3" height="6" rx="1.5"/>
+            <rect x="8" y="8" width="3" height="16" rx="1.5"/>
+            <rect x="14.5" y="3" width="3" height="26" rx="1.5"/>
+            <rect x="21" y="9.5" width="3" height="13" rx="1.5"/>
+            <rect x="27" y="14" width="3" height="4" rx="1.5"/>
+          </g>
+        </svg>
+      </div>
+      <div class="brandtxt"><b>Tonality Gym</b><span>Voice · Tone · Power</span></div>
+    </div>
+
+    <div class="hud" id="hud" role="button" tabindex="0"></div>
+
+    <nav id="nav"></nav>
+
+    <div class="railfoot">
+      <button class="iconbtn" id="themeBtn" title="Toggle theme">◐</button>
+      <button class="iconbtn" id="settingsBtn" title="Settings">⚙</button>
+      <button class="iconbtn" id="helpBtn" title="Keyboard shortcuts">?</button>
+      <div class="micdot" id="micdot"><i></i><span>mic</span></div>
+    </div>
+  </aside>
+
+  <main id="main"><div id="view"></div></main>
+</div>
+
+<div id="stage">
+  <div class="stop">
+    <span class="nm" id="stName"></span>
+    <span class="pg mono" id="stPos"></span>
+    <div class="stprog"><i id="stProg" style="width:0%"></i></div>
+    <span class="pg mono" id="stClock">0:00</span>
+    <div class="spacer"></div>
+    <button class="btn gh sm" id="stRestart">Restart</button>
+    <button class="btn sec sm" id="stExit">Exit <kbd>esc</kbd></button>
+  </div>
+  <div class="stbody"><div class="stinner" id="stBody"></div></div>
+  <div class="stfoot">
+    <div class="sthint" id="stHint"></div>
+    <button class="btn gh sm" id="stPrev">← Back</button>
+    <button class="btn" id="stNext">Next →</button>
+  </div>
+</div>
+
+<div id="modal"><div class="mbox" id="mbox"></div></div>
+<div id="toasts"></div>

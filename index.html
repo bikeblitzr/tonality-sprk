@@ -2046,6 +2046,465 @@ var SCRIPTS = [
 
 <script>
 /* ============================================================
+   THE TONALITY ADVISOR
+   A deterministic rules engine. Takes where you are in the call,
+   the line you are about to say, and what the room is doing —
+   returns which tone to use, why, what to emphasise, where to
+   pause, and which tone would be a mistake.
+
+   No model at runtime. Every recommendation traces back to a
+   named rule, which is shown to the user.
+   ============================================================ */
+'use strict';
+
+/* ---------- call stages, each a prior over tones ---------- */
+var STAGES = [
+{id:'frame',    n:'Opening & frame',      hint:'First two minutes. Setting the terms.',
+ tones:{warm:3, invite:2.6, certainty:2.2, nq_playful:2, takeaway:1.6, sl_care:1.6, nq_neutral:1.4}},
+{id:'discovery',n:'Discovery — situation', hint:'Facts. How it works now.',
+ tones:{nq_curious:3.2, neutral:3, probe:2, nq_neutral:1.8, reflect:1.4}},
+{id:'pain',     n:'Pain & problem',        hint:'What it costs them. Emotional disclosure.',
+ tones:{concern:3.2, nq_concern:3, sl_pain:2.4, reflect:2, probe:1.8}},
+{id:'account',  n:'Accountability',        hint:'Ownership. Confronting the pattern.',
+ tones:{challenge:3.2, nq_challenge:2.6, skeptic:2, confront:1.6, measured:1.2}},
+{id:'conseq',   n:'Consequence',           hint:'Cost of doing nothing.',
+ tones:{consequence:3.5, nq_challenge:2.2, c_grave:1.6, challenge:1.4}},
+{id:'vision',   n:'Vision & future pace',  hint:'What it looks like if it works.',
+ tones:{vision:3.5, c_hopeful:1.8, intrigue:1.4, warm:1.2}},
+{id:'transition',n:'Transition into pitch',hint:'Summarising, moving on.',
+ tones:{certainty:3.4, sl_presup:1.8, nq_neutral:1.4, invite:1.2}},
+{id:'pitch',    n:'Presenting',            hint:'Explaining what it is.',
+ tones:{sl_certain:2.8, b_teach:2.6, sl_obvious:2, intrigue:1.8, absolute:1.6, sincerity:1.6}},
+{id:'tiedown',  n:'Tie-downs',             hint:'Extracting their reasons.',
+ tones:{probe:3, invite:2.4, nq_curious:2.2, reflect:2, skeptic:1.6}},
+{id:'objection',n:'Objection',             hint:'They pushed back.',
+ tones:{unbothered:2.8, sl_hypo:2.6, invite:2.2, sincerity:2, measured:1.8, absolute:1.6}},
+{id:'close',    n:'The ask',               hint:'Asking for the decision.',
+ tones:{sl_close:3.6, nq_soft:2.4, certainty:1.8, absolute:1.4}},
+{id:'postyes',  n:'After the yes',         hint:'Logistics. Do not re-sell.',
+ tones:{sl_presup:3.4, c_bright:2, certainty:1.8, warm:1.6}},
+{id:'bad',      n:'Bad news / repair',     hint:'Something went wrong.',
+ tones:{apology:3, c_grave:2.6, sincerity:2.4, c_soothe:2, c_clinical:1.8}},
+{id:'lead',     n:'Managing / feedback',   hint:'Not a sale. A person who works for you.',
+ tones:{confront:2.4, sincerity:2.4, disappoint:2, nurture:1.8, measured:1.8, command:1.4}},
+{id:'speak',    n:'Presenting to a room',  hint:'One to many.',
+ tones:{b_keynote:2.6, b_narrate:2.2, b_teach:2.2, b_anchor:1.8, gravity:1.6}}
+];
+
+/* ---------- situational modifiers ---------- */
+var MODS = [
+{id:'defensive', n:'They have gone defensive', ic:'▲',
+ up:{c_soothe:3, unbothered:2.4, measured:2, sincerity:1.8, invite:1.6},
+ down:{challenge:-3, confront:-3.5, nq_challenge:-2.5, skeptic:-2, c_impatient:-3, takeaway:-1.5},
+ why:'Pressure applied to a defensive person hardens the position. Drop your own energy and let entrainment bring theirs down — you cannot argue someone out of a defence.'},
+{id:'quiet', n:'They have gone quiet', ic:'◌',
+ up:{probe:3.2, invite:2.4, reflect:2, nq_concern:1.8, confused:1.4},
+ down:{sl_certain:-2.5, b_teach:-2, absolute:-1.5, c_bright:-2},
+ why:'Silence after a disclosure is usually processing, not disengagement. Anything you say to fill it interrupts them. Ask four words and wait.'},
+{id:'excited', n:'They are excited / selling it back', ic:'▲',
+ up:{sl_close:3.5, sl_presup:2.4, nq_soft:1.8},
+ down:{sl_certain:-2, b_teach:-2.5, intrigue:-2, sl_obvious:-1.5},
+ why:'They are closing themselves. Every extra sentence you add now is a new surface for a new objection. Stop and ask.'},
+{id:'price', n:'Price just came up', ic:'£',
+ up:{sl_hypo:3, absolute:2.2, sl_close:2, sincerity:1.8, c_clinical:1.6},
+ down:{scarce:-2, c_apolog:-2.5, invite:-1},
+ why:'Isolate before you handle. Find out whether it is the number or the thing, and never apologise for the number — a flat delivery with no pause after it is what stops it becoming a negotiation.'},
+{id:'think', n:'They said "let me think about it"', ic:'…',
+ up:{sl_hypo:3.2, probe:2.6, confront:2, sincerity:2, invite:1.8},
+ down:{sl_close:-2.5, urgent:-3, scarce:-2.5, sl_presup:-2},
+ why:'That sentence is a mask for exactly one concern. Closing harder makes them defend the mask. Isolate what is actually underneath it first.'},
+{id:'senior', n:'Senior or highly skeptical buyer', ic:'◆',
+ up:{c_clinical:3, c_proud:2.2, measured:2, unbothered:1.8, sincerity:1.6},
+ down:{sl_certain:-3, nq_playful:-2.5, c_delight:-2, intrigue:-1.5, sl_question:-2},
+ why:'Enthusiasm reads as junior to this buyer. Specificity is what buys credibility — the precise number, the actual failure rate, the real constraint.'},
+{id:'first', n:'First 90 seconds of the call', ic:'◐',
+ up:{warm:2.6, invite:2.2, nq_playful:1.8, certainty:1.4},
+ down:{consequence:-3, confront:-3.5, challenge:-2.5, disappoint:-3, c_menace:-4},
+ why:'You have no licence yet. Anything confrontational this early reads as aggression rather than honesty, and you cannot get the licence back.'},
+{id:'trust', n:'Deep rapport already built', ic:'✓',
+ up:{confront:2, challenge:1.8, nq_challenge:1.8, takeaway:1.4, c_wry:1.4},
+ down:{},
+ why:'Directness is now available to you and it is worth spending. The moves that would have detonated the call at minute two are the ones that move it at minute forty.'},
+{id:'phone', n:'Phone, not video or in person', ic:'☏',
+ up:{},
+ down:{c_conspir:-1.5, scarce:-1},
+ why:'The visual channel is gone, so every signal has to be acoustic. Slow about ten percent, compress your dynamic range — a whisper disappears into a phone codec — and add more verbal acknowledgement, because they cannot see you nodding. Phone codecs also cut low frequencies, which strips the chest resonance that carries authority; compensate with articulation, not volume.'},
+{id:'group', n:'More than one person listening', ic:'⚉',
+ up:{b_teach:2, c_clinical:1.8, b_anchor:1.4, certainty:1.4},
+ down:{c_conspir:-3, c_tender:-2.5, confront:-2},
+ why:'Never confront anyone in front of colleagues — they will defend the position publicly whatever they privately think. Find the quiet one and give them a private route to say it.'},
+{id:'rushed', n:'They are short on time', ic:'⏱',
+ up:{c_bright:2.4, urgent:2, c_clinical:2, command:1.4},
+ down:{vision:-2.5, b_narrate:-3, intrigue:-2, gravity:-1.5},
+ why:'Vision and story work need room. Under time pressure they read as stalling. Lead with the conclusion and offer the reasoning second.'}
+];
+
+/* ---------- lexical / structural triggers ---------- */
+var TRIGGERS = [
+/* duration & history */
+{re:/\b(how long|how many (months|years|weeks)|since when|been going on|up until now)\b/i,
+ w:{concern:2.8, nq_concern:2.4, sl_pain:1.6},
+ why:'A duration question lands directly on accumulated cost. Lean in physically — the lean lowers your larynx and softens your volume without you having to act it.'},
+{re:/\b(what have you (actually |really )?(done|tried)|what did you do about)\b/i,
+ w:{challenge:2.8, nq_challenge:2, skeptic:1.4},
+ why:'This separates research from action, and it only works if you slow down. Intensity here comes from pace and pitch floor, never from volume.'},
+
+/* accountability */
+{re:/\b(who('s| is) responsible|whose (fault|decision)|what('s| is) (really )?(stopping|holding) you)\b/i,
+ w:{challenge:3.2, nq_challenge:2.4, confront:1.4},
+ why:'An ownership question. They must arrive at the answer themselves — a reframe you deliver is a claim they can argue with, one they produce is a position they defend.'},
+{re:/\b(why hasn'?t|why haven'?t|why did(n'?t)? you)\b/i,
+ w:{challenge:2.6, skeptic:1.8, nq_challenge:1.6},
+ why:'Carries an implicit accusation. Only the tone stops it landing as one — low, slow, no volume increase, and a full second of silence after.'},
+
+/* doubt */
+{re:/\b(what makes you (think|believe)|why now|why this|are you sure|really\?|how confident)\b/i,
+ w:{skeptic:3, nq_challenge:1.6, confused:1.2},
+ why:'You are asking them to justify a belief. Keep the volume down — skepticism delivered quietly reads as curiosity, delivered firmly it reads as an accusation.'},
+
+/* consequence */
+{re:/\b(if nothing changes|what happens (if|then)|next year|twelve months|settle for|stay(ing)? (the same|where you are)|cost of waiting|do nothing)\b/i,
+ w:{consequence:3.6, nq_challenge:1.8, c_grave:1.4},
+ why:'The consequence beat. Lowest, slowest, quietest thing you will say all call — and underplay it, because the content is already heavy and adding weight on top makes it theatre.'},
+
+/* vision */
+{re:/\b(let'?s say|imagine|picture|what would (that|it) (look|feel)|how would (life|things|that) change|twelve months from now|if we (helped|got) you)\b/i,
+ w:{vision:3.6, c_hopeful:1.4, intrigue:1.2},
+ why:'Future pace. Ask, then stop completely — the picture forms in the silence, not in your description of it. If you keep talking you are describing your vision, not building theirs.'},
+
+/* opening / why-they-came */
+{re:/\b(what made you|why did you (book|reach|call|take)|what was it about|what brought you)\b/i,
+ w:{nq_curious:2.8, neutral:2.2, sl_care:1.6, warm:1.2},
+ why:'Asking why they came. Their own stated reason for trusting you is the strongest thing you own and it is free — but only if the question sounds genuinely interested rather than procedural. Slow the back half.'},
+
+/* probes — short, open-ended follow-ups */
+{re:/^\s*(say more|tell me more|meaning|like what|such as|and\??|go on|how so|which part|in what way|what specifically|more on that|expand)\b/i,
+ w:{probe:4, reflect:1.4},
+ why:'A probe works because it is short. Say the four words and then say nothing at all — the shorter the probe, the more they fill.'},
+
+/* correction / clarification */
+{re:/\b(it'?s not .{1,30}(it'?s|but)|not quite|that'?s not (quite )?(right|what)|the other way round|actually,? it)\b/i,
+ w:{measured:2.8, c_clinical:1.4, absolute:1.2},
+ why:'A correction. Deaccent the corrected item — say the right version at <em>lower</em> prominence than the wrong one and it lands as a clarification rather than a rebuke. Do not speed up; speeding up sounds defensive.'},
+
+/* closes */
+{re:/\b(do you want (our|my) help|shall we|want to (go ahead|get started|do this)|should we (set|get)|are you in|what do you say)\b/i,
+ w:{sl_close:4, nq_soft:2},
+ why:'The ask. Deliver it flatter and more ordinary than everything around it, then stop dead. The flatness only works because of the silence that follows it.'},
+{re:/\b(paid in full|payment plan|deposit|which (one )?works|card|invoice|start date)\b/i,
+ w:{sl_presup:3, c_bright:1.6, certainty:1.4},
+ why:'Post-yes logistics. Calm and matter-of-fact — any energy here reads as relief, and relief tells them you were not sure.'},
+
+/* price */
+{re:/\b(costs?|price|pricing|investment|tuition|\$\s?\d|£\s?\d|\d+\s?(k|grand|thousand))\b/i,
+ w:{sl_close:2, c_clinical:2, absolute:1.6},
+ why:'State the number flatly and keep moving. A pause immediately after a price is an invitation to object — do not leave one.'},
+
+/* objection handling */
+{re:/\b(hypothetically|money aside|setting .{0,12}aside|if (cost|price|money|that) (weren'?t|wasn'?t)|pretend it)\b/i,
+ w:{sl_hypo:4, invite:1.4},
+ why:'An isolation question. It has to sound genuinely low-stakes or they see the trap — and if you argue with the answer you get, you have taught them the question was fake.'},
+{re:/\b(anything else|is that the only|if we (sort|sorted|fix|fixed) that)\b/i,
+ w:{invite:2.4, sl_hypo:2.2, probe:1.6},
+ why:'Isolating down to one concern. Rising terminal, light and quick — this is one of the few places a lift is correct.'},
+
+/* permission & frame */
+{re:/\b(can i (be|ask)|would it be (alright|ok)|do you mind|is that (fair|cool|ok)|mind if i)\b/i,
+ w:{invite:3.4, nq_soft:1.4},
+ why:'A permission ask, and one of the few sentences that should genuinely rise at the end. One rise, then go back to falls — it only works against a floor of falling terminals.'},
+{re:/\b(i(\'| a)m going to be (straight|honest)|can i be (completely )?(honest|straight|blunt)|to be honest with you)\b/i,
+ w:{sincerity:3.2, invite:2, confront:1.2},
+ why:'You are buying a licence. Drop your energy below the line before it — sincerity is a fall in intensity, and if the previous line was already soft it has nowhere to land.'},
+
+/* takeaway / disqualification */
+{re:/\b(not sure this is (a fit|right)|might not be|i don'?t think (we|you) should|probably isn'?t for you|rather (we didn'?t|not)|people we can'?t help)\b/i,
+ w:{takeaway:3.8, sincerity:1.6, c_clinical:1.2},
+ why:'The takeaway, and it only works if you mean it. Flat, unemotional, slightly quieter — you are withdrawing, so actually withdraw. A fake one teaches them everything else was technique too.'},
+
+/* apology & bad news */
+{re:/\b(my (mistake|fault)|i (got|was) (that )?wrong|i(\'| a)m sorry|apolog|should have (told|said))\b/i,
+ w:{apology:3.8, sincerity:2, c_grave:1.2},
+ why:'One apology, one sentence about what changes, then move. No "but", no explanation until they ask for one — the apology ends exactly where the excuse would start.'},
+{re:/\b(difficult news|didn'?t (go|work out)|we lost|bad news|has to be said|not going to (be able|happen))\b/i,
+ w:{c_grave:3.2, apology:1.8, c_clinical:1.8, sincerity:1.6},
+ why:'Underplay it. The more serious the content, the flatter the delivery should be — heavy content plus heavy delivery reads as manufactured.'},
+
+/* authority */
+{re:/\b(this works|i (know|guarantee)|i(\'| ha)ve (seen|watched) (it|this) work|not going to be a problem|will not find|nowhere else)\b/i,
+ w:{absolute:3.4, sl_certain:1.4},
+ why:'One absolute-certainty line per conversation, on the single load-bearing claim. Anchor it physically — the body produces this tone more reliably than intention does. Then follow it with sincerity so it does not tip into dominance.'},
+{re:/\b(stop|now|do it|send it|put it down|get me|no\.)\b/i, short:true,
+ w:{command:2.6, absolute:1.2},
+ why:'A command. Short, complete, no hedges, steepest fall in the system — and reserve it, because one per hour gets obeyed and one every four minutes gets ignored.'},
+
+/* teaching */
+{re:/\b(there are (three|two|four)|here'?s how it works|think of it (like|as)|step (one|two)|first.{0,25}then|let me (show|explain))\b/i,
+ w:{b_teach:3.2, sl_certain:1.6, c_bright:1.2},
+ why:'One idea per intonation phrase, and deaccent every term the second time you say it. Repeating a word at full prominence is what makes teaching sound patronising.'},
+
+/* intrigue */
+{re:/\b(the reason|something i want to show|here'?s the (bit|part)|nobody (mentions|tells)|what actually happen|let me tell you)\b/i,
+ w:{intrigue:3, sl_obvious:1.4, b_keynote:1.2},
+ why:'Stretch one sonorant in the key word to create the suspension — then pay it off within two sentences, because intrigue that is not delivered on becomes irritation.'},
+
+/* mirror */
+{re:/^\s*["“'].{2,40}["”']\s*$/,
+ w:{reflect:4},
+ why:'A mirror. Their exact words, their register, one beat slower, falling terminal — a mirror that rises becomes a challenge.'},
+
+/* obviousness pivot */
+{re:/\b(obviously|of course|sure,? it|that'?s (a )?given|table stakes|goes without saying)\b/i,
+ w:{sl_obvious:3.2, c_wry:1.2},
+ why:'Deaccent the obvious clause and re-energise on the pivot — but only ever deaccent something they have already agreed to. Deaccenting a contested claim is how you lose an argument you never had.'},
+
+/* feedback / management */
+{re:/\b(third time|not the standard|expected (better|more)|you told me|this isn'?t like you|we(\'| ha)ve (had|been) (this|through))\b/i,
+ w:{disappoint:3.2, confront:2.4, measured:1.4},
+ why:'Quiet and slow, with no anger in it at all — disappointment is anger that has been allowed to cool, and it lands considerably harder. Say it once, say what happens next, then return to normal energy.'},
+
+/* de-escalation */
+{re:/\b(one piece at a time|i(\'| ha)ve got (it|you)|we(\'| wi)ll sort|tell me what happened|from the start|not going anywhere)\b/i,
+ w:{c_soothe:3.4, reassure:2, sincerity:1.4},
+ why:'Go slower and quieter than they are and they will match you within about three exchanges. Never name their emotion as a problem — let entrainment do it silently.'},
+
+/* reassurance */
+{re:/\b(that'?s normal|happens to (nearly |almost )?every|you'?re not behind|nothing (you|unusual)|completely fine|fixable)\b/i,
+ w:{reassure:3.4, nurture:1.6, warm:1.2},
+ why:'Normalise with a fact rather than a feeling. "That happens to about half of them" beats "do not worry" every time.'},
+
+/* gratitude */
+{re:/\b(thank you for|i appreciate|that took|you didn'?t have to|owe you)\b/i,
+ w:{gratitude:3.4, sincerity:1.6, warm:1.4},
+ why:'Name the specific thing it cost them, then stop. Generic thanks reads as punctuation; specific thanks reads as attention.'},
+
+/* scarcity */
+{re:/\b(two left|last one|only \d+|until (friday|monday|the end)|waiting list|cap(ped)? (this|at)|closes)\b/i,
+ w:{scarce:3.2, c_clinical:1.4},
+ why:'Only ever state a limit you could put in writing. Voiced but quiet — a true whisper has no pitch and loses every ounce of authority in the line.'},
+
+/* urgency */
+{re:/\b(today|right now|this week|deadline|before (friday|monday)|window|can'?t wait)\b/i,
+ w:{urgent:2.4, certainty:1.2},
+ why:'Urgency is fast and low. Panic is fast and high. If your pitch rises with your rate you have produced anxiety, and anxiety is contagious.'}
+];
+
+/* ---------- structural analysis ---------- */
+var STOPWORDS = ('a an the and or but if of to in on at for with from by as is are was were be been being am do does did done have has had will would can could shall should may might must ' +
+  'i you he she it we they me him her us them my your his its our their this that these those there here what which who whom whose when where why how not no nor so than then too very just about into over under again further once').split(' ');
+var STOP = {}; STOPWORDS.forEach(function(w){ STOP[w]=1; });
+
+function tokenise(s){
+  return String(s||'').trim().split(/\s+/).filter(Boolean).map(function(w){
+    return {raw:w, clean:w.toLowerCase().replace(/[^a-z0-9'’-]/g,'')};
+  });
+}
+function isContent(w){ return w.clean && !STOP[w.clean] && w.clean.length>1; }
+
+function analyseForm(line){
+  var t=String(line||'').trim();
+  var f={
+    isQuestion: /\?\s*$/.test(t),
+    isWh: /^\s*(what|why|how|when|where|who|which|whose)\b/i.test(t),
+    isYesNo: false,
+    isImperative: false,
+    words: tokenise(t).length,
+    hedges: [],
+    contrast: null,
+    repeats: []
+  };
+  f.isYesNo = f.isQuestion && !f.isWh &&
+    /^\s*(is|are|was|were|do|does|did|can|could|will|would|shall|should|have|has|had|am|may|might|must|any|so)\b/i.test(t);
+  f.isImperative = !f.isQuestion && /^\s*(stop|go|do|send|put|get|come|look|listen|tell|give|take|call|sit|leave|wait|show|make)\b/i.test(t);
+
+  var HEDGE=/\b(just|sort of|kind of|maybe|perhaps|possibly|i think|i guess|a bit|a little|probably|sorry|quickly|if that('| i)s ok|i could be wrong|might)\b/gi, m;
+  while((m=HEDGE.exec(t))) f.hedges.push(m[0]);
+
+  var c = t.match(/\bnot\s+(?:the\s+|a\s+|an\s+)?([\w'’-]+)\b[^.]*?\b(?:it'?s|its|but|it is)\s+(?:the\s+|a\s+|an\s+)?([\w'’-]+)/i);
+  if(c) f.contrast={from:c[1], to:c[2]};
+
+  var seen={}, toks=tokenise(t);
+  toks.forEach(function(w,i){
+    if(!isContent(w)) return;
+    if(seen[w.clean]!=null) f.repeats.push({word:w.raw, first:seen[w.clean], again:i});
+    else seen[w.clean]=i;
+  });
+  return f;
+}
+
+/* where the nuclear accent should land */
+function findNucleus(line, form){
+  var toks=tokenise(line);
+  if(!toks.length) return null;
+  if(form.contrast){
+    for(var i=toks.length-1;i>=0;i--)
+      if(toks[i].clean===form.contrast.to.toLowerCase().replace(/[^a-z0-9'’-]/g,''))
+        return {i:i, word:toks[i].raw, rule:'contrast',
+          why:'Contrast overrides everything. "'+form.contrast.from+'" versus "'+form.contrast.to+'" is the whole point of the sentence, so the accent goes on the correction — and it needs the low onglide: dip below your baseline immediately before the peak, or it just reads as ordinary emphasis and the contrast does not land.'};
+  }
+  for(var j=toks.length-1;j>=0;j--){
+    if(isContent(toks[j])){
+      var rep=null;
+      form.repeats.forEach(function(r){ if(r.again===j) rep=r; });
+      if(rep){
+        for(var k=j-1;k>=0;k--) if(isContent(toks[k]) && k!==rep.first)
+          return {i:k, word:toks[k].raw, rule:'given',
+            why:'"'+rep.word+'" has already been said, so it is given information and loses the accent. Re-accenting a word you already used is the most common cause of speech that sounds patronising, and almost nobody notices they are doing it.'};
+      }
+      return {i:j, word:toks[j].raw, rule:'default',
+        why:'Default focus falls on the last content word. Everything after it should drop in pitch range and volume — that is post-focus compression, and it improves how clearly a listener identifies your emphasis by twenty-five to thirty percentage points.'};
+    }
+  }
+  return {i:toks.length-1, word:toks[toks.length-1].raw, rule:'default', why:'Last word carries it.'};
+}
+
+/* ---------- the engine ---------- */
+function advise(input){
+  var stageId=input.stage, line=String(input.line||'').trim(), mods=input.mods||[];
+  var stage = STAGES.filter(function(s){return s.id===stageId;})[0] || STAGES[0];
+  var scores={}, reasons=[], warnings=[];
+
+  function add(id, v, why, src){
+    if(!TONE_BY_ID[id]) return;
+    scores[id]=(scores[id]||0)+v;
+    if(why) reasons.push({tone:id, v:v, why:why, src:src});
+  }
+
+  Object.keys(stage.tones).forEach(function(id){
+    add(id, stage.tones[id], null, 'stage');
+  });
+  reasons.push({tone:null, v:0, src:'stage',
+    why:'Stage — <b>'+stage.n+'</b>. '+stage.hint+' That sets the starting distribution before anything you typed is considered.'});
+
+  var fired=[];
+  if(line){
+    TRIGGERS.forEach(function(t){
+      if(t.short && tokenise(line).length>7) return;
+      if(t.re.test(line)){
+        fired.push(t);
+        Object.keys(t.w).forEach(function(id){ add(id, t.w[id], null, 'phrase'); });
+        reasons.push({tone:Object.keys(t.w)[0], v:0, src:'phrase', why:t.why});
+      }
+    });
+  }
+
+  var form = analyseForm(line);
+  if(line){
+    if(form.isWh){ add('nq_curious',1.4,null,'form'); add('neutral',1.2,null,'form'); }
+    if(form.isYesNo){ add('invite',1.4,null,'form'); add('nq_soft',1,null,'form'); }
+    if(form.isImperative){ add('command',2,null,'form'); }
+    if(!form.isQuestion && form.words>22){ add('b_teach',1.4,null,'form'); add('b_narrate',1,null,'form'); }
+    if(!form.isQuestion && form.words<=5){ add('sl_close',0.8,null,'form'); add('probe',0.8,null,'form'); }
+  }
+
+  mods.forEach(function(mid){
+    var m=MODS.filter(function(x){return x.id===mid;})[0];
+    if(!m) return;
+    Object.keys(m.up||{}).forEach(function(id){ add(id, m.up[id], null, 'mod'); });
+    Object.keys(m.down||{}).forEach(function(id){ add(id, m.down[id], null, 'mod'); });
+    reasons.push({tone:null, v:0, src:'mod', why:'<b>'+m.n+'.</b> '+m.why});
+    Object.keys(m.down||{}).forEach(function(id){
+      if(m.down[id]<=-2.5 && TONE_BY_ID[id]) warnings.push({tone:id, why:m.n});
+    });
+  });
+
+  // locked out entirely
+  var locked=[];
+  Object.keys(scores).forEach(function(id){
+    if(scores[id]<0){ locked.push(id); delete scores[id]; }
+  });
+
+  var ranked=Object.keys(scores)
+    .filter(function(id){ return TONE_BY_ID[id] && S.tierUnlocked(TONE_BY_ID[id].tier); })
+    .map(function(id){ return {id:id, tone:TONE_BY_ID[id], score:scores[id]}; })
+    .sort(function(a,b){ return b.score-a.score; });
+
+  if(!ranked.length) ranked=[{id:'neutral', tone:TONE_BY_ID.neutral, score:1}];
+
+  var top=ranked[0].score, total=ranked.reduce(function(s,r){ return s+Math.max(0,r.score); },0)||1;
+  ranked.forEach(function(r){ r.pct=Math.round(r.score/total*100); });
+
+  var confidence = ranked.length>1 ? Math.min(99, Math.round(40 + (ranked[0].score-ranked[1].score)/Math.max(1,top)*55 + (fired.length?12:0))) : 70;
+
+  return {
+    stage:stage, ranked:ranked.slice(0,4), reasons:reasons, warnings:warnings,
+    locked:locked.map(function(id){ return TONE_BY_ID[id]; }).filter(Boolean),
+    form:form, nucleus: line? findNucleus(line, form) : null,
+    fired:fired.length, confidence:confidence, line:line
+  };
+}
+
+/* ---------- delivery instruction for a specific line ---------- */
+function deliveryNotes(res){
+  if(!res.line) return [];
+  var t=res.ranked[0].tone, f=res.form, out=[];
+
+  var lo=t.target.term[0], hi=t.target.term[1];
+  var wantRise = lo > 0, wantFall = hi < 0, spans = lo<=0 && hi>=0;
+  out.push({
+    k:'Terminal',
+    v: wantRise ? 'Lift the last word — up '+lo+' to '+hi+' semitones'
+       : wantFall ? 'Land the last word down — '+Math.abs(hi)+' to '+Math.abs(lo)+' semitones below the peak'
+       : 'Gentle fall or held level — anywhere from '+Math.abs(lo)+' down to '+hi+' up',
+    d: spans
+        ? 'This tone tolerates either. A soft fall closes the thought; holding it level leaves it suspended so they keep imagining. On a future-pace question the level tone is usually stronger — it signals there is more to come and stops them treating it as answered.'
+        : (f.isQuestion && wantFall
+        ? 'It is written as a question but this tone wants a falling terminal. That is correct and deliberate: a wh-question delivered with a rise sounds uncertain, and in this position the fall is what makes it land as genuine curiosity rather than an interrogation.'
+        : (!f.isQuestion && wantRise
+        ? 'It is a statement but this tone lifts. Use it only on setup material — never on a claim, a price, a commitment or a close, where a rise hollows the content out.'
+        : t.recipe.terminal))
+  });
+
+  if(res.nucleus){
+    out.push({k:'Emphasis', v:'Hit “'+String(res.nucleus.word).replace(/[.,!?;:]+$/,'')+'”', d:res.nucleus.why});
+  }
+
+  var pauseWhere = f.isQuestion
+    ? 'Two full seconds after the question mark. Longer than feels survivable — anything under about 1.5 seconds and you will answer it yourself, which is the most common self-inflicted wound in selling.'
+    : (res.ranked[0].id==='consequence' || res.ranked[0].id==='c_grave' || res.ranked[0].id==='gravity')
+    ? 'A full second before you start, and a longer one after you finish. The silence carries the weight the words deliberately do not.'
+    : (res.ranked[0].id==='sl_close')
+    ? 'Nothing before it. Then absolute silence after. Whoever speaks first loses, and ten seconds feels like sixty from the inside — count it.'
+    : 'A short beat before the emphasised word. A pause promotes whatever precedes it, so you get emphasis for free without raising your voice.';
+  out.push({k:'Pause', v:'Where the silence goes', d:pauseWhere});
+
+  out.push({k:'Pace', v:t.target.wpm[0]+'–'+t.target.wpm[1]+' wpm', d:t.recipe.pace});
+
+  if(f.hedges.length){
+    out.push({k:'Cut these', v:f.hedges.join(', '),
+      d:'Every hedge is a small withdrawal from your own credibility. Delete them and say the identical sentence with a falling terminal — nothing else changes, and listen to what happens to the claim.'});
+  }
+  if(f.contrast){
+    out.push({k:'Contrastive scoop', v:'"'+f.contrast.from+'" → "'+f.contrast.to+'"',
+      d:'Dip below your baseline immediately before the peak on the correction, and let the peak arrive about a tenth of a second later than it would in ordinary emphasis. That low onglide is what makes a contrast audible, and it is exactly what most people leave out.'});
+  }
+  if(f.words>28 && !f.isQuestion){
+    out.push({k:'Too long', v:f.words+' words in one breath',
+      d:'Skilled English speakers phrase at around five and a half syllables. Break this into two or three intonation phrases with real pauses between them, or the emphasis has nowhere to sit.'});
+  }
+  return out;
+}
+
+/* ---------- shared state for the Custom Prompt view ----------
+   Global on purpose: both the view and the custom drill mode read it,
+   and they live in separate closures.                              */
+var CP = {stage:'discovery', line:'', mods:[], res:null};
+
+/* renders the line with the nucleus marked and post-focus material dimmed */
+function markLine(r){
+  if(!r || !r.line) return '';
+  function esc2(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  var toks=r.line.trim().split(/\s+/);
+  var n=r.nucleus?r.nucleus.i:-1;
+  return toks.map(function(w,i){
+    if(i===n) return '<span class="em">'+esc2(w)+'</span>';
+    if(n>=0 && i>n) return '<span class="soft">'+esc2(w)+'</span>';
+    return esc2(w);
+  }).join(' ') + (r.form && r.form.isQuestion ? ' <span class="pz">⟨ 2s ⟩</span>' : '');
+}
+</script>
+
+<script>
+/* ============================================================
    THE CODEX — the theory. Read once, reference forever.
    ============================================================ */
 'use strict';
@@ -3931,6 +4390,7 @@ function toggleTheme(){ setTheme(document.documentElement.getAttribute('data-the
 var NAV=[
 {g:'Train'},
 {id:'home',      ic:'◉', n:'Today'},
+{id:'coach',     ic:'✦', n:'Custom Prompt'},
 {id:'modules',   ic:'▦', n:'All Drills'},
 {id:'tones',     ic:'◐', n:'Tone Library', tag:function(){return TONES.length;}},
 {id:'twisters',  ic:'⟡', n:'Articulation', tag:function(){return TWISTERS.length;}},
@@ -4823,6 +5283,77 @@ function mCalibrate(arg){
     D.next=close;
   }
 
+  draw();
+}
+
+/* ============================================================
+   MODE: CUSTOM LINE
+   Drills the line the advisor was just given, in the tone it
+   recommended — then the runner-up, so the choice gets trained
+   and not just the execution.
+   ============================================================ */
+function mCustom(){
+  var res = (typeof CP!=='undefined' && CP.res) ? CP.res : null;
+  if(!res || !res.line){
+    UI.toast('Write a line in Custom Prompt first'); UI.go('coach'); return;
+  }
+  var primary=res.ranked[0].tone;
+  var alt=res.ranked[1]?res.ranked[1].tone:null;
+  var items=[
+    {t:primary, l:res.line, tag:'Recommended'},
+    {t:primary, l:res.line, tag:'Again — tighter'},
+    {t:primary, l:res.line, tag:'Third rep'}
+  ];
+  if(alt) items.push({t:alt, l:res.line, tag:'Now the alternative'});
+  items.push({t:primary, l:res.line, tag:'Back to the recommendation'});
+
+  D={i:0};
+  open('Your line · '+primary.name, items.length);
+
+  function draw(){
+    if(D.i>=items.length) return customEnd();
+    var it=items[D.i], t=it.t;
+    var notes = D.i===0 ? deliveryNotes(res) : [];
+    body('<div class="cue">'+toneChip(t)+
+      '<span class="chip tiny">'+esc(it.tag)+'</span>'+
+      (t.id!==primary.id?'<span class="chip cy tiny">compare against the recommendation</span>':'')+'</div>'+
+      '<p class="tiny dim2" style="margin:-6px 0 14px;max-width:70ch"><b style="color:var(--ink)">Cue:</b> '+esc(t.cue)+'</p>'+
+      '<p class="utter sm">'+(t.id===primary.id? markLine(res) : esc(res.line))+'</p>'+
+      (notes.length?'<div class="note acc" style="margin-bottom:14px">'+
+        notes.slice(0,3).map(function(n){ return '<b>'+esc(n.k)+':</b> '+esc(n.v); }).join('<br>')+'</div>':'')+
+      (t.id!==primary.id?'<div class="note cy" style="margin-bottom:14px"><span class="l">Why this rep matters</span>'+
+        'Same words, different intent. Being able to hear the gap between two plausible tones on your own sentence is the skill — picking the right one is downstream of being able to tell them apart.</div>':'')+
+      targetPills(t)+
+      recPanel({h:130}));
+    hint('<b>'+esc(t.recipe.terminal)+'</b>');
+    foot(D.i===items.length-1?'Finish →':'Next →');
+    wireRecorder(function(a){
+      var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
+      if(!r) return;
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      D.results.push({tone:t, score:r.score, isAlt:t.id!==primary.id});
+      $('#result').innerHTML='<hr style="margin:20px 0 18px">'+
+        '<div class="scorewrap">'+UI.ring(r.score)+
+        '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score, t)+'</p>'+
+        '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · '+esc(t.name)+' mastery '+S.masteryOf(t.id)+'%</p></div></div>'+
+        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins);
+      if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
+    }, {maxSec:26});
+  }
+  function customEnd(){
+    var main=D.results.filter(function(x){return !x.isAlt;}).map(function(x){return x.score;});
+    var altS=D.results.filter(function(x){return x.isAlt;}).map(function(x){return x.score;});
+    var avg=main.length?Math.round(main.reduce(function(a,b){return a+b;},0)/main.length):0;
+    var first=main[0], last=main[main.length-1];
+    end(avg+' on your line',
+      (main.length>1 && last>first ? 'Went from '+first+' to '+last+' across the session — that is the rep working. ' : '')+
+      (altS.length? 'You also ran it as '+alt.name+'. Play both back if you recorded them: the words never changed, and that gap is entirely tone. ' : '')+
+      'Save the scenario in Custom Prompt and it will be here next time.',
+      'custom line');
+  }
+  D.next=function(){ D.i++; draw(); };
+  D.prev=function(){ if(D.i>0){D.i--; draw();} };
+  D.restart=function(){ D.i=0; D.results=[]; draw(); };
   draw();
 }
 
@@ -5812,7 +6343,7 @@ function end(title, sub, name){
    launcher
    ============================================================ */
 var MODES={
-  calibrate:mCalibrate,
+  calibrate:mCalibrate, custom:mCustom,
   warmup:mWarmup, tonelab:mToneLab, terminal:mTerminal, monotone:mMonotone,
   pace:mPace, pausegym:mPause, floor:mFloor, twisters:mTwisters,
   emphasis:mEmphasis, contour:mContour, script:mScript, roulette:mRoulette,
@@ -6315,6 +6846,208 @@ UI.registerView('path:act', function(a,arg){
     if(arg==='today'){ var n=UI.$('.day.today'); if(n) n.scrollIntoView({block:'center'}); return; }
     S.raw().day=+arg; S.save(); UI.render();
     setTimeout(function(){ var n=UI.$('.day.today'); if(n) n.scrollIntoView({block:'center'}); },40);
+  }
+});
+
+/* ============================================================ CUSTOM PROMPT TONALITY */
+UI.registerView('coach', function(){
+  var saved=S.raw().scenarios||[];
+  return '<div class="page wide">'+
+  '<div class="phead"><p class="kick">Tell it where you are · it tells you how to say it</p>'+
+  '<h1>Custom Prompt Tonality</h1>'+
+  '<p class="lede">Pick the moment you are in, paste the line you are about to say, flag what the room is doing — and it returns the tone to use, why that one, where the emphasis goes, where the silence goes, and which tone would be a mistake here. Then you drill <em>your</em> line, not a sample one.</p></div>'+
+
+  '<div class="split" style="grid-template-columns:400px 1fr;align-items:start;gap:24px">'+
+
+  /* ---- input column ---- */
+  '<div style="position:sticky;top:0">'+
+  '<div class="card">'+
+  '<p class="lbl" style="margin-bottom:9px">1 · Where are you in the call?</p>'+
+  '<select id="cpStage" style="margin-bottom:5px">'+STAGES.map(function(s){
+    return '<option value="'+s.id+'"'+(CP.stage===s.id?' selected':'')+'>'+esc(s.n)+'</option>'; }).join('')+'</select>'+
+  '<p class="tiny dim" id="cpStageHint" style="margin:0 0 18px">'+esc((STAGES.filter(function(s){return s.id===CP.stage;})[0]||STAGES[0]).hint)+'</p>'+
+
+  '<p class="lbl" style="margin-bottom:9px">2 · What are you about to say?</p>'+
+  '<textarea id="cpLine" placeholder="Paste the actual line. A question, a claim, a close — whatever you are about to put in their ear." style="min-height:92px;margin-bottom:6px">'+esc(CP.line)+'</textarea>'+
+  '<p class="tiny dim" style="margin:0 0 18px">Or leave it blank and it will recommend from the stage and situation alone.</p>'+
+
+  '<p class="lbl" style="margin-bottom:9px">3 · What is the room doing?</p>'+
+  '<div class="row" style="gap:6px;margin-bottom:6px">'+MODS.map(function(m){
+    var on=CP.mods.indexOf(m.id)>=0;
+    return '<button class="chip'+(on?' acc':'')+'" data-act="mod" data-arg="'+m.id+'" style="cursor:pointer;font-size:11.5px;padding:5px 10px">'+
+      m.ic+' '+esc(m.n)+'</button>'; }).join('')+'</div>'+
+  '<p class="tiny dim" style="margin:0 0 18px">Optional, and they stack. These are what change the answer most.</p>'+
+
+  '<button class="btn blk big" data-act="run">Tell me the tone</button>'+
+  (CP.res?'<button class="btn gh blk sm" data-act="clear" style="margin-top:8px">Clear</button>':'')+
+  '</div>'+
+
+  (saved.length?'<div class="card" style="margin-top:12px">'+
+   '<p class="lbl" style="margin-bottom:10px">Your saved scenarios <span class="dim">('+saved.length+')</span></p>'+
+   saved.slice().reverse().slice(0,8).map(function(sc,i){
+     var idx=saved.length-1-i, t=TONE_BY_ID[sc.tone];
+     return '<div style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)">'+
+       '<div style="flex:1;min-width:0"><p class="tiny" style="margin:0 0 3px;color:var(--ink)">“'+esc(sc.line.slice(0,58))+(sc.line.length>58?'…':'')+'”</p>'+
+       '<span class="chip tiny" style="color:'+(t?FAMILIES[t.fam].c:'var(--muted)')+'">'+esc(t?t.name:sc.tone)+'</span></div>'+
+       '<button class="btn gh sm" data-act="load" data-arg="'+idx+'" style="padding:3px 8px;font-size:11px">open</button>'+
+       '<button class="btn gh sm" data-act="del" data-arg="'+idx+'" style="padding:3px 7px;font-size:11px">✕</button></div>';
+   }).join('')+'</div>':'')+
+  '</div>'+
+
+  /* ---- results column ---- */
+  '<div id="cpOut">'+(CP.res?renderAdvice(CP.res):emptyAdvice())+'</div>'+
+  '</div></div>';
+});
+
+function emptyAdvice(){
+  return '<div class="card" style="padding:30px 26px">'+
+  '<h3 style="font-size:18px;margin-bottom:8px">How this decides</h3>'+
+  '<div class="prose" style="font-size:14.5px">'+
+  '<p>It is a rules engine, not a language model — everything runs in your browser, instantly and offline, and every recommendation traces back to a named rule that gets shown to you. Three signals, combined:</p>'+
+  '<p><b>The stage</b> sets a prior. Discovery leans curious and neutral; consequence leans low and slow; the ask leans flat and unremarkable. That is the starting distribution before anything you type.</p>'+
+  '<p><b>Your line</b> is matched against about thirty phrase patterns and analysed structurally — question or statement, wh- or yes/no, imperative, hedged, contrastive, how long. A duration question pulls hard toward concern. "Who is responsible" pulls toward accountability. "If nothing changes" pulls toward the consequence drop.</p>'+
+  '<p><b>The modifiers</b> move it most, and they can veto. Flag that they have gone defensive and confrontation gets locked out entirely, no matter what the stage said.</p>'+
+  '<h4>What it is bad at</h4>'+
+  '<p>Sarcasm, industry jargon it has never seen, and anything where the right tone depends on history it has no access to. It reads the shape of your sentence, not your relationship. When it is wrong, the second and third suggestions are usually where the right answer is — and there is a button to tell me when it misses.</p>'+
+  '</div></div>';
+}
+
+function renderAdvice(r){
+  var top=r.ranked[0], t=top.tone, notes=deliveryNotes(r);
+  var fam=FAMILIES[t.fam];
+  var conf = r.confidence>=75?'high':r.confidence>=55?'moderate':'low';
+
+  return '<div class="card" style="border-color:'+fam.c+';border-width:1px;padding:0;overflow:hidden">'+
+  '<div style="height:3px;background:'+fam.c+'"></div>'+
+  '<div style="padding:20px 22px">'+
+  '<div class="row" style="margin-bottom:10px">'+
+  '<span class="chip tiny" style="background:transparent;border-color:'+fam.c+';color:'+fam.c+'">'+esc(fam.name)+'</span>'+
+  '<span class="spacer"></span>'+
+  '<span class="tiny dim mono">'+r.confidence+'% · '+conf+' confidence</span></div>'+
+  '<h2 style="font-size:26px;letter-spacing:-.02em;margin-bottom:6px">'+esc(t.name)+'</h2>'+
+  '<p class="dim2" style="font-size:15px;margin-bottom:14px">'+esc(t.conveys)+'</p>'+
+  '<div class="note acc" style="margin-bottom:0"><span class="l">Do this before you speak</span>'+esc(t.cue)+'</div>'+
+  '<div class="row" style="margin-top:16px">'+
+  '<button class="btn" data-act="drill">▶ Drill this line</button>'+
+  '<button class="btn sec" data-act="save">Save scenario</button>'+
+  '<button class="btn gh sm" data-go="tones" data-arg="'+t.id+'">Full recipe</button>'+
+  '<span class="spacer"></span>'+
+  '<button class="btn gh sm" data-act="wrong" title="Log this as a miss">Wrong call?</button>'+
+  '</div></div></div>'+
+
+  (r.line?'<div class="card" style="margin-top:12px">'+
+   '<p class="lbl" style="margin-bottom:12px">Say it like this</p>'+
+   '<p class="utter xs" style="margin-bottom:16px">'+markLine(r)+'</p>'+
+   '<div class="grid" style="gap:9px">'+notes.map(function(n){
+     return '<div style="display:grid;grid-template-columns:118px 1fr;gap:14px;padding:10px 0;border-top:1px solid var(--line)">'+
+       '<div><p class="lbl" style="margin:0 0 3px">'+esc(n.k)+'</p>'+
+       '<p class="tiny" style="margin:0;color:var(--ink);font-weight:600">'+esc(n.v)+'</p></div>'+
+       '<p class="tiny dim2" style="margin:0">'+esc(n.d)+'</p></div>';
+   }).join('')+'</div></div>':'')+
+
+  '<div class="card" style="margin-top:12px">'+
+  '<p class="lbl" style="margin-bottom:12px">Why this one</p>'+
+  '<div class="grid" style="gap:8px">'+r.reasons.filter(function(x){return x.why;}).slice(0,7).map(function(x){
+    var badge = x.src==='stage'?'stage':x.src==='mod'?'situation':x.src==='phrase'?'your words':'structure';
+    var col = x.src==='mod'?'var(--no)':x.src==='phrase'?'var(--cy)':'var(--muted)';
+    return '<div style="display:flex;gap:11px;align-items:flex-start;padding:9px 0;border-top:1px solid var(--line)">'+
+      '<span class="chip tiny" style="flex:none;color:'+col+';border-color:'+col+';background:transparent">'+badge+'</span>'+
+      '<p class="tiny dim2" style="margin:0;flex:1">'+x.why+'</p></div>';
+  }).join('')+'</div></div>'+
+
+  (r.ranked.length>1?'<div class="card" style="margin-top:12px">'+
+   '<p class="lbl" style="margin-bottom:5px">Also in play</p>'+
+   '<p class="tiny dim" style="margin-bottom:12px">Rarely one right answer. If the top pick feels wrong for this person, it is usually one of these — and hearing the difference is the actual skill.</p>'+
+   '<div class="grid gauto-s">'+r.ranked.slice(1).map(function(x){
+     return '<button class="btn sec" data-act="alt" data-arg="'+x.id+'" style="justify-content:flex-start;text-align:left;padding:11px 13px;height:100%">'+
+       '<span><b style="display:block;font-size:13px;color:'+FAMILIES[x.tone.fam].c+'">'+esc(x.tone.name)+'</b>'+
+       '<span class="tiny dim">'+x.pct+'% weight · '+esc(x.tone.conveys.slice(0,44))+'…</span></span></button>';
+   }).join('')+'</div></div>':'')+
+
+  ((r.warnings.length||r.locked.length)?'<div class="note no" style="margin-top:12px">'+
+   '<span class="l">Do not use these here</span>'+
+   (r.locked.length? r.locked.map(function(t2){return '<b>'+esc(t2.name)+'</b>';}).join(', ')+' — ruled out by the situation you flagged. ' : '')+
+   (r.warnings.length? r.warnings.slice(0,3).map(function(w){
+     return '<b>'+esc(TONE_BY_ID[w.tone].name)+'</b> ('+esc(w.why.toLowerCase())+')'; }).join(', ')+'.' : '')+
+   '</div>':'')+
+
+  '<p class="tiny dim" style="margin-top:14px">Matched '+r.fired+' phrase pattern'+(r.fired===1?'':'s')+
+  ' · '+(r.form.words||0)+' words · '+(r.form.isQuestion?'question':'statement')+
+  (r.form.hedges.length?' · '+r.form.hedges.length+' hedge'+(r.form.hedges.length>1?'s':'')+' detected':'')+
+  (r.form.contrast?' · contrastive':'')+'</p>';
+}
+
+
+UI.registerView('coach:after', function(){
+  var st=$('#cpStage'); if(st) st.onchange=function(){
+    CP.stage=this.value;
+    var s=STAGES.filter(function(x){return x.id===CP.stage;})[0];
+    var h=$('#cpStageHint'); if(h&&s) h.textContent=s.hint;
+  };
+  var ln=$('#cpLine'); if(ln) ln.oninput=function(){ CP.line=this.value; };
+  if(ln) ln.onkeydown=function(e){
+    if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); runAdvice(); }
+  };
+});
+
+function runAdvice(){
+  CP.res = advise({stage:CP.stage, line:CP.line, mods:CP.mods});
+  var out=$('#cpOut'); if(out) out.innerHTML=renderAdvice(CP.res);
+  else UI.render();
+}
+
+UI.registerView('coach:act', function(a, arg){
+  var s=S.raw();
+  if(a==='mod'){
+    var i=CP.mods.indexOf(arg);
+    if(i>=0) CP.mods.splice(i,1); else CP.mods.push(arg);
+    UI.render();
+    if(CP.res) runAdvice();
+  }
+  if(a==='run'){
+    var ln=$('#cpLine'); if(ln) CP.line=ln.value;
+    runAdvice();
+  }
+  if(a==='clear'){ CP.res=null; CP.line=''; CP.mods=[]; UI.render(); }
+  if(a==='alt'){
+    // promote an alternative to the top and re-render
+    var idx=-1; CP.res.ranked.forEach(function(x,j){ if(x.id===arg) idx=j; });
+    if(idx>0){ var picked=CP.res.ranked.splice(idx,1)[0]; CP.res.ranked.unshift(picked); }
+    $('#cpOut').innerHTML=renderAdvice(CP.res);
+  }
+  if(a==='drill'){
+    if(!CP.res) return;
+    Drill.launch('custom');
+  }
+  if(a==='save'){
+    if(!CP.res) return;
+    s.scenarios=(s.scenarios||[]).concat([{
+      line:CP.res.line||'(no line)', stage:CP.stage, mods:CP.mods.slice(),
+      tone:CP.res.ranked[0].id, at:Date.now()
+    }]).slice(-40);
+    S.save(); UI.toast('Scenario saved'); UI.render();
+  }
+  if(a==='load'){
+    var sc=(s.scenarios||[])[+arg]; if(!sc) return;
+    CP.stage=sc.stage; CP.line=sc.line; CP.mods=(sc.mods||[]).slice();
+    runAdvice(); UI.render(); runAdvice();
+  }
+  if(a==='del'){
+    (s.scenarios||[]).splice(+arg,1); S.save(); UI.render();
+  }
+  if(a==='wrong'){
+    s.advisorMisses=(s.advisorMisses||[]).concat([{
+      stage:CP.stage, line:CP.res.line, mods:CP.mods.slice(),
+      gave:CP.res.ranked[0].id, at:Date.now()
+    }]).slice(-60);
+    S.save();
+    UI.modal('<h2>Logged as a miss</h2>'+
+      '<p class="dim2" style="font-size:14.5px;margin-top:6px">Saved locally with the stage, your line and what it recommended. '+
+      'Nothing is sent anywhere.</p>'+
+      '<div class="note cy" style="margin-top:14px"><span class="l">Why this is worth doing</span>'+
+      'The rules engine can only match patterns it has been given. A handful of logged misses is exactly what is needed to add the missing rules — export them from Progress and send them over, and they become new triggers.</div>'+
+      '<p class="tiny dim" style="margin-top:12px">'+((s.advisorMisses||[]).length)+' logged so far.</p>'+
+      '<div class="row" style="margin-top:14px"><button class="btn" onclick="UI.closeModal()">Done</button></div>');
   }
 });
 

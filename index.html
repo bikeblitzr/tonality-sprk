@@ -534,6 +534,7 @@ label.ck input{width:15px;height:15px;margin:3px 0 0;flex:none;accent-color:var(
 
     <div class="railfoot">
       <button class="iconbtn" id="themeBtn" title="Toggle theme">◐</button>
+      <button class="iconbtn" id="fbBtn" title="Send feedback">✎</button>
       <button class="iconbtn" id="settingsBtn" title="Settings">⚙</button>
       <button class="iconbtn" id="helpBtn" title="Keyboard shortcuts">?</button>
       <div class="micdot" id="micdot"><i></i><span>mic</span></div>
@@ -4072,6 +4073,278 @@ return {
 
 <script>
 /* ============================================================
+   CLOUD — Supabase auth, sync and telemetry.
+
+   Local-first by design. The app works completely without an
+   account and completely offline; the cloud is additive. If the
+   CDN is blocked, the network is down, or the config is blank,
+   everything degrades to exactly the previous behaviour.
+
+   NEVER uploads audio. Derived numbers only.
+   ============================================================ */
+'use strict';
+
+var CLOUD_CONFIG = {
+  url: 'https://pbppdiytunqhbouyreek.supabase.co',
+  key: 'sb_publishable_JldfAxoUGGHON5PXY7e20w_SmCAT1_f'
+};
+
+var Cloud = (function(){
+
+var sb=null, ready=false, booting=null;
+var user=null, profile=null;
+var listeners=[];
+var queue=[];              // telemetry waiting to flush
+var pushTimer=null, flushTimer=null;
+var sessionStart=Date.now(), activeMs=0, lastTick=Date.now(), focused=true;
+
+function on(fn){ listeners.push(fn); }
+function emit(){ listeners.forEach(function(f){ try{f();}catch(e){} }); }
+
+function configured(){ return !!(CLOUD_CONFIG.url && CLOUD_CONFIG.key); }
+
+/* ---------- boot ---------- */
+function boot(){
+  if(booting) return booting;
+  if(!configured()) return Promise.resolve(false);
+  booting = import('https://esm.sh/@supabase/supabase-js@2').then(function(m){
+    sb = m.createClient(CLOUD_CONFIG.url, CLOUD_CONFIG.key, {
+      auth:{persistSession:true, autoRefreshToken:true, detectSessionInUrl:false}
+    });
+    return sb.auth.getSession();
+  }).then(function(res){
+    ready = true;
+    var s = res && res.data && res.data.session;
+    if(s && s.user){ user = s.user; return loadProfile().then(pullAll); }
+  }).then(function(){
+    if(sb) sb.auth.onAuthStateChange(function(evt, sess){
+      if(evt==='SIGNED_OUT'){ user=null; profile=null; emit(); }
+    });
+    emit();
+    return true;
+  }).catch(function(e){
+    ready=false;
+    console.warn('[cloud] unavailable —', e && e.message);
+    return false;
+  });
+  return booting;
+}
+
+/* ---------- auth ---------- */
+function signUp(f){
+  // f: {email, pin, username, fullName, phone}
+  if(!ready) return Promise.reject(new Error('Cloud not ready'));
+  if(!/^\d{6}$/.test(f.pin)) return Promise.reject(new Error('PIN must be exactly 6 digits'));
+  return sb.auth.signUp({
+    email: f.email.trim(),
+    password: f.pin,
+    options:{ data:{
+      username: (f.username||'').trim(),
+      full_name: (f.fullName||'').trim(),
+      phone: (f.phone||'').trim(),
+      org: 'sprk'
+    }}
+  }).then(function(r){
+    if(r.error) throw r.error;
+    user = r.data.user;
+    if(!r.data.session){
+      // shouldn't happen with confirm-email off, but handle it
+      return signIn(f.email, f.pin);
+    }
+    return loadProfile().then(function(){ return pushAll(true); });
+  }).then(function(){ emit(); return true; });
+}
+
+function signIn(email, pin){
+  if(!ready) return Promise.reject(new Error('Cloud not ready'));
+  return sb.auth.signInWithPassword({email:email.trim(), password:pin}).then(function(r){
+    if(r.error) throw r.error;
+    user = r.data.user;
+    return loadProfile().then(pullAll);
+  }).then(function(){ emit(); return true; });
+}
+
+function signOut(){
+  if(!ready) return Promise.resolve();
+  return pushAll(true).catch(function(){}).then(function(){
+    return sb.auth.signOut();
+  }).then(function(){ user=null; profile=null; emit(); });
+}
+
+function loadProfile(){
+  if(!user) return Promise.resolve(null);
+  return sb.from('profiles').select('*').eq('id', user.id).maybeSingle().then(function(r){
+    profile = r.data || null;
+    if(profile) sb.from('profiles').update({last_seen:new Date().toISOString()}).eq('id',user.id).then(function(){});
+    return profile;
+  });
+}
+
+function signedIn(){ return !!user; }
+function isAdmin(){ return !!(profile && profile.role==='admin'); }
+function me(){ return {user:user, profile:profile}; }
+
+/* ---------- sync ---------- */
+function pullAll(){
+  if(!user) return Promise.resolve();
+  return Promise.all([
+    sb.from('progress').select('payload,updated_at').eq('user_id',user.id).maybeSingle(),
+    sb.from('voice_profiles').select('payload').eq('user_id',user.id).maybeSingle()
+  ]).then(function(res){
+    var p = res[0] && res[0].data, v = res[1] && res[1].data;
+    var local = S.raw();
+    if(p && p.payload && Object.keys(p.payload).length){
+      var remote = p.payload;
+      // remote wins only if it is genuinely further along — protects a
+      // fresh browser from wiping a phone's progress and vice versa
+      if((remote.reps||0) >= (local.reps||0)) S.mergeRemote(remote);
+    }
+    if(v && v.payload && v.payload.done && !(local.profile && local.profile.done)){
+      S.raw().profile = v.payload; Audio.setProfile(v.payload); S.save();
+    }
+    if(window.UI) UI.render();
+  }).catch(function(e){ console.warn('[cloud] pull failed', e && e.message); });
+}
+
+function pushAll(immediate){
+  if(!user || !ready) return Promise.resolve();
+  if(!immediate){
+    clearTimeout(pushTimer);
+    return new Promise(function(res){ pushTimer=setTimeout(function(){ pushAll(true).then(res); }, 4000); });
+  }
+  var s = S.raw(), lp = S.levelProgress();
+  var payload = JSON.parse(JSON.stringify(s));
+  delete payload.advisorMisses;   // those go to their own table
+  payload.secondsActive = Math.round(totalSeconds());
+
+  var jobs = [
+    sb.from('progress').upsert({
+      user_id:user.id, payload:payload, xp:s.xp|0, level:lp.lvl|0,
+      reps:s.reps|0, streak:s.streak|0, updated_at:new Date().toISOString()
+    }, {onConflict:'user_id'})
+  ];
+  if(s.profile && s.profile.done){
+    var vp=s.profile;
+    jobs.push(sb.from('voice_profiles').upsert({
+      user_id:user.id, payload:vp,
+      modal_hz:vp.modalHz||null, low_hz:vp.lowHz||null, high_hz:vp.highHz||null,
+      flat_span: vp.flat?vp.flat.span:null,
+      nat_span:  vp.natural?vp.natural.span:null,
+      ceil_span: vp.expressive?vp.expressive.span:null,
+      updated_at:new Date().toISOString()
+    }, {onConflict:'user_id'}));
+  }
+  return Promise.all(jobs).catch(function(e){ console.warn('[cloud] push failed', e && e.message); });
+}
+
+/* ---------- telemetry ---------- */
+function log(table, row){
+  if(!configured()) return;
+  queue.push({t:table, r:row});
+  if(queue.length>400) queue.shift();
+  clearTimeout(flushTimer);
+  flushTimer=setTimeout(flush, 2500);
+}
+function flush(){
+  if(!ready || !user || !queue.length) return Promise.resolve();
+  var batch=queue.splice(0, queue.length);
+  var byTable={};
+  batch.forEach(function(x){
+    (byTable[x.t]=byTable[x.t]||[]).push(Object.assign({user_id:user.id}, x.r));
+  });
+  return Promise.all(Object.keys(byTable).map(function(t){
+    return sb.from(t).insert(byTable[t]);
+  })).catch(function(e){
+    console.warn('[cloud] telemetry flush failed', e && e.message);
+    queue = batch.concat(queue);   // put it back, try again later
+  });
+}
+
+function logRep(o){
+  log('reps', {
+    tone:o.tone||null, drill:o.drill||null, score:o.score==null?null:Math.round(o.score),
+    wpm:num(o.wpm), span:num(o.span), term:num(o.term), dyn:num(o.dyn),
+    pause_frac:num(o.pauseFrac), floor_drop:num(o.floorDrop), fry_pct:num(o.fryPct),
+    base_hz:num(o.baseHz), personalised: !!o.personalised
+  });
+}
+function logFairness(o){
+  log('fairness_flags', {
+    verdict:o.verdict, tone:o.tone||null, score:o.score==null?null:Math.round(o.score),
+    acoustics:o.acoustics||null, note:o.note||null
+  });
+}
+function logAdvisorMiss(o){
+  log('advisor_misses', {
+    stage:o.stage||null, line:(o.line||'').slice(0,600),
+    mods:o.mods||[], recommended:o.recommended||null, expected:o.expected||null
+  });
+}
+function logFeedback(o){
+  log('feedback', {page:o.page||null, message:(o.message||'').slice(0,4000), context:o.context||null});
+  return flush();
+}
+function num(v){ return (v==null||isNaN(v))?null:Math.round(v*100)/100; }
+
+/* ---------- time on task ---------- */
+function tick(){
+  var now=Date.now();
+  if(focused && now-lastTick < 65000) activeMs += now-lastTick;
+  lastTick=now;
+}
+function totalSeconds(){
+  tick();
+  return (S.raw().secondsActive||0) + activeMs/1000;
+}
+setInterval(function(){
+  tick();
+  if(activeMs > 30000){
+    S.raw().secondsActive = Math.round((S.raw().secondsActive||0) + activeMs/1000);
+    activeMs = 0; S.save();
+    if(user) pushAll();
+  }
+}, 30000);
+document.addEventListener('visibilitychange', function(){
+  tick(); focused = !document.hidden; lastTick=Date.now();
+});
+window.addEventListener('beforeunload', function(){
+  tick();
+  S.raw().secondsActive = Math.round((S.raw().secondsActive||0) + activeMs/1000);
+  S.save();
+});
+
+/* ---------- admin ---------- */
+function team(){
+  if(!ready || !isAdmin()) return Promise.resolve(null);
+  return Promise.all([
+    sb.from('team_overview').select('*').order('reps', {ascending:false}),
+    sb.from('team_weak_tones').select('*'),
+    sb.from('fairness_flags').select('*').order('created_at',{ascending:false}).limit(60),
+    sb.from('advisor_misses').select('*').order('created_at',{ascending:false}).limit(60),
+    sb.from('feedback').select('*').order('created_at',{ascending:false}).limit(60),
+    sb.from('reps').select('user_id,tone,score,created_at,drill').order('created_at',{ascending:false}).limit(800)
+  ]).then(function(r){
+    return {
+      people:  r[0].data||[], weak: r[1].data||[],
+      fairness:r[2].data||[], misses:r[3].data||[],
+      feedback:r[4].data||[], reps:r[5].data||[]
+    };
+  }).catch(function(e){ console.warn('[cloud] team fetch failed', e && e.message); return null; });
+}
+
+return {
+  boot:boot, configured:configured, isReady:function(){return ready;},
+  signUp:signUp, signIn:signIn, signOut:signOut,
+  signedIn:signedIn, isAdmin:isAdmin, me:me, on:on,
+  pushAll:pushAll, pullAll:pullAll, flush:flush,
+  logRep:logRep, logFairness:logFairness, logAdvisorMiss:logAdvisorMiss, logFeedback:logFeedback,
+  totalSeconds:totalSeconds, team:team
+};
+})();
+</script>
+
+<script>
+/* ============================================================
    STATE — persistence, XP, mastery, streaks, spaced repetition
    ============================================================ */
 'use strict';
@@ -4112,6 +4385,8 @@ var S = (function(){
              sibilant:null,   // {sHz, shHz, ratio, flag}
              natural:null,    // {wpm, span, term, dyn, pauseFrac, floorDrop, baseHz}
              history:[]},     // past calibrations, for drift
+    scenarios:[], advisorMisses:[],
+    secondsActive:0,
     firstSeen:null
   };
   var s = Store.get() || JSON.parse(JSON.stringify(def));
@@ -4194,6 +4469,15 @@ var S = (function(){
     var xp = score==null ? 6 : Math.max(5, Math.round(score/6) + (score>=90?12:score>=75?6:0));
     s.xp+=xp;
     checkAch(); save();
+    // mirror to the cloud if signed in — derived numbers only, never audio
+    if(window.Cloud && Cloud.signedIn && Cloud.signedIn()){
+      Cloud.logRep({tone:toneId, drill:(extra&&extra.drill)||null, score:score,
+        wpm:extra&&extra.wpm, span:extra&&extra.span, term:extra&&extra.term,
+        dyn:extra&&extra.dyn, pauseFrac:extra&&extra.pauseFrac,
+        floorDrop:extra&&extra.floorDrop, fryPct:extra&&extra.fryPct,
+        baseHz:extra&&extra.baseHz, personalised:s.prefs.personalTargets});
+      Cloud.pushAll();
+    }
     if(window.UI && UI.paintHud) UI.paintHud();
     return xp;
   }
@@ -4317,6 +4601,39 @@ var S = (function(){
     return Math.abs(st) > 3.5 ? {st:+st.toFixed(1), measured:Math.round(med), profile:Math.round(p.modalHz)} : null;
   }
 
+  /* merge a remote snapshot in, keeping whichever side is further along
+     on each counter so signing in on a second device never loses work */
+  function mergeRemote(r){
+    if(!r || typeof r!=='object') return;
+    ['xp','reps','scored','sessions','streak','bestStreak','day','secondsActive'].forEach(function(k){
+      if(typeof r[k]==='number') s[k]=Math.max(s[k]||0, r[k]);
+    });
+    ['mastery','twisters','codexRead','powerRead','ach','dayDone'].forEach(function(k){
+      if(r[k] && typeof r[k]==='object'){
+        s[k]=s[k]||{};
+        Object.keys(r[k]).forEach(function(id){
+          var a=s[k][id], b=r[k][id];
+          if(a==null){ s[k][id]=b; return; }
+          if(typeof a==='number' && typeof b==='number'){ s[k][id]=Math.max(a,b); return; }
+          if(typeof a==='object' && typeof b==='object'){
+            s[k][id]=Object.assign({}, b, a);
+            if(b.m!=null && a.m!=null) s[k][id].m=Math.max(a.m,b.m);
+            if(b.n!=null && a.n!=null) s[k][id].n=Math.max(a.n,b.n);
+            if(b.best!=null && a.best!=null) s[k][id].best=Math.max(a.best,b.best);
+            if(b.last!=null && a.last!=null) s[k][id].last=Math.max(a.last,b.last);
+          }
+        });
+      }
+    });
+    if(Array.isArray(r.hist) && r.hist.length > (s.hist||[]).length) s.hist=r.hist.slice(-900);
+    if(Array.isArray(r.scenarios) && r.scenarios.length > (s.scenarios||[]).length) s.scenarios=r.scenarios;
+    if(r.profile && r.profile.done && !(s.profile && s.profile.done)){
+      s.profile=r.profile; if(window.Audio && Audio.setProfile) Audio.setProfile(r.profile);
+    }
+    if(r.prefs) s.prefs=Object.assign({}, r.prefs, s.prefs);
+    save();
+  }
+
   function reset(){ Store.clear(); location.reload(); }
   function exportJson(){ return JSON.stringify(s,null,2); }
   function importJson(txt){
@@ -4328,6 +4645,7 @@ var S = (function(){
     raw:function(){return s;}, save:save, level:level, levelProgress:levelProgress,
     addXp:addXp, recordRep:recordRep, masteryOf:masteryOf, rawMastery:rawMastery,
     saveProfile:saveProfile, profile:profile, clearProfile:clearProfile, profileDrift:profileDrift,
+    mergeRemote:mergeRemote,
     weakQueue:weakQueue, tierUnlocked:tierUnlocked, tierNeed:tierNeed,
     grant:grant, checkAch:checkAch, noteMetric:noteMetric, stats:stats, touchDay:touchDay,
     reset:reset, exportJson:exportJson, importJson:importJson, today:today
@@ -4401,7 +4719,16 @@ var NAV=[
 {id:'power',     ic:'♆', n:'Power & Psych'},
 {g:'You'},
 {id:'path',      ic:'⟶', n:'90-Day Path'},
-{id:'progress',  ic:'▲', n:'Progress'}
+{id:'progress',  ic:'▲', n:'Progress'},
+{id:'account',   ic:'◍', n:'Account'}
+];
+var NAV_ADMIN=[
+{g:'Admin'},
+{id:'admin',     ic:'▚', n:'Team'},
+{g:'Your own training'},
+{id:'home',      ic:'◉', n:'Today'},
+{id:'progress',  ic:'▲', n:'Progress'},
+{id:'account',   ic:'◍', n:'Account'}
 ];
 
 var view='home', viewArg=null;
@@ -4415,19 +4742,33 @@ function go(v, arg){
 }
 
 function paintNav(){
-  $('#nav').innerHTML = NAV.map(function(n){
+  $('#nav').innerHTML = (isAdminMode()?NAV_ADMIN:NAV).map(function(n){
     if(n.g) return '<div class="navgrp">'+esc(n.g)+'</div>';
     var tag = n.tag ? '<span class="tag">'+n.tag()+'</span>' : '';
     return '<button class="nb'+(view===n.id?' on':'')+'" data-go="'+n.id+'"><span class="ic">'+n.ic+'</span>'+esc(n.n)+tag+'</button>';
   }).join('');
 }
 
+var adminMode=false;
+function isAdminMode(){ return adminMode && window.Cloud && Cloud.isAdmin(); }
+
 function paintHud(){
   var p=S.levelProgress(), s=S.raw();
+  var admin = window.Cloud && Cloud.isAdmin && Cloud.isAdmin();
   $('#hud').innerHTML =
+    (admin?'<div class="seg" style="width:100%;margin:0 0 10px;display:flex" id="roleSeg">'+
+      '<button data-r="student" style="flex:1"'+(!adminMode?' class="on"':'')+'>Student</button>'+
+      '<button data-r="admin" style="flex:1"'+(adminMode?' class="on"':'')+'>Admin</button></div>':'')+
     '<div class="hudtop"><span class="hudlvl">Level <i>'+p.lvl+'</i></span><span class="hudrank">'+esc(p.rank)+'</span></div>'+
     '<div class="xpbar"><i style="width:'+p.pct.toFixed(1)+'%"></i></div>'+
     '<div class="hudsub"><span>'+p.cur+' / '+p.need+' xp</span><span><b>'+s.streak+'</b>d streak · <b>'+s.reps+'</b> reps</span></div>';
+  var seg=$('#roleSeg');
+  if(seg) seg.onclick=function(e){
+    var b=e.target.closest('[data-r]'); if(!b) return;
+    e.stopPropagation();
+    adminMode = b.dataset.r==='admin';
+    go(adminMode?'admin':'home');
+  };
 }
 
 function paintMic(){
@@ -4628,9 +4969,33 @@ document.addEventListener('click', function(e){
 });
 
 $('#themeBtn').onclick=toggleTheme;
+$('#fbBtn').onclick=feedbackModal;
 $('#railToggle').onclick=function(){ $('#rail').classList.toggle('open'); $('#scrim').classList.toggle('on'); };
 $('#scrim').onclick=function(){ $('#rail').classList.remove('open'); $('#scrim').classList.remove('on'); };
 $('#hud').onclick=function(){ go('progress'); };
+/* ---------- feedback ---------- */
+function feedbackModal(){
+  modal('<h2>Tell me what is wrong with it</h2>'+
+    '<p class="dim2" style="font-size:14.5px;margin-top:6px">Anything — a score that felt unfair, a drill that made no sense, '+
+    'a tone that is missing, wording that is confusing. This is a beta and the misses are the useful part.</p>'+
+    '<textarea id="fbMsg" placeholder="What happened, and what did you expect instead?" style="min-height:120px;margin-top:14px"></textarea>'+
+    '<p class="tiny dim" style="margin-top:8px">Sent with the page you are on and your level. No audio, ever.'+
+    (Cloud.signedIn()?'':' <b style="color:var(--acc)">You are not signed in — this will only be stored in this browser.</b>')+'</p>'+
+    '<div class="row" style="margin-top:14px"><button class="btn" id="fbSend">Send</button>'+
+    '<button class="btn gh" onclick="UI.closeModal()">Cancel</button></div>');
+  $('#fbMsg').focus();
+  $('#fbSend').onclick=function(){
+    var m=$('#fbMsg').value.trim();
+    if(!m){ closeModal(); return; }
+    var s=S.raw();
+    var ctx={level:S.levelProgress().lvl, reps:s.reps, calibrated:!!(s.profile&&s.profile.done),
+             personalTargets:!!s.prefs.personalTargets, ua:navigator.userAgent.slice(0,120)};
+    if(Cloud.signedIn()) Cloud.logFeedback({page:view, message:m, context:ctx});
+    else { s.localFeedback=(s.localFeedback||[]).concat([{page:view,message:m,at:Date.now()}]).slice(-40); S.save(); }
+    closeModal(); toast('Thank you — logged');
+  };
+}
+
 $('#helpBtn').onclick=function(){
   modal('<h2>Keyboard</h2><div class="prose" style="margin-top:12px">'+
   '<table><tr><td><kbd>space</kbd></td><td>Start / stop recording in a drill</td></tr>'+
@@ -4723,7 +5088,8 @@ return {
   toast:toast, modal:modal, closeModal:closeModal, setTheme:setTheme, toggleTheme:toggleTheme,
   go:go, render:render, registerView:registerView, paintHud:paintHud, paintMic:paintMic,
   needMic:needMic, LiveScope:LiveScope, drawContour:drawContour, drawWave:drawWave,
-  ring:ring, readouts:readouts, faultList:faultList,
+  ring:ring, readouts:readouts, faultList:faultList, feedbackModal:feedbackModal,
+  isAdminMode:isAdminMode, setAdminMode:function(v){adminMode=!!v;},
   current:function(){return view;}, arg:function(){return viewArg;}
 };
 })();
@@ -4921,6 +5287,37 @@ function playback(){
 /* ---------------- utility ---------------- */
 /* "vs your baseline" strip — always shown when a profile exists, alongside
    the standard score rather than instead of it. Two honest numbers. */
+/* "Was that score fair?" — the highest-value telemetry in the app.
+   The audio engine was validated against synthetic signals, not real
+   voices, so this is how a systematic misread on a particular kind of
+   voice actually surfaces instead of quietly making someone give up. */
+function fairnessStrip(tone, score, a){
+  var id='fair'+Math.random().toString(36).slice(2,8);
+  setTimeout(function(){
+    var w=document.getElementById(id); if(!w) return;
+    w.onclick=function(e){
+      var b=e.target.closest('[data-fair]'); if(!b) return;
+      var v=b.dataset.fair;
+      if(window.Cloud && Cloud.signedIn()){
+        Cloud.logFairness({verdict:v, tone:tone&&tone.id, score:score,
+          acoustics:{wpm:a&&Math.round(a.dur*10)/10, span:a&&+a.span.toFixed(1), term:a&&+a.term.toFixed(1),
+                     dyn:a&&+a.dyn.toFixed(1), floorDrop:a&&+a.floorDrop.toFixed(1),
+                     baseHz:a&&Math.round(a.baseline), fryPct:a&&Math.round(a.fryPct)}});
+      } else {
+        var s=S.raw(); s.localFairness=(s.localFairness||[]).concat([{v:v,tone:tone&&tone.id,score:score,at:Date.now()}]).slice(-60); S.save();
+      }
+      w.innerHTML='<p class="tiny dim" style="margin:0">Logged — thank you. That is what makes the scoring better.</p>';
+    };
+  },0);
+  return '<div id="'+id+'" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line);'+
+    'display:flex;gap:9px;align-items:center;flex-wrap:wrap">'+
+    '<span class="tiny dim">Was that score fair?</span>'+
+    '<button class="btn gh sm" data-fair="about_right" style="padding:3px 10px;font-size:11.5px">Fair</button>'+
+    '<button class="btn gh sm" data-fair="too_low" style="padding:3px 10px;font-size:11.5px">Too harsh</button>'+
+    '<button class="btn gh sm" data-fair="too_high" style="padding:3px 10px;font-size:11.5px">Too generous</button>'+
+    '</div>';
+}
+
 function baselineStrip(r){
   if(!r || !r.vsBase || !r.vsBase.length) return '';
   var hr=r.vsBase.headroom;
@@ -5330,7 +5727,7 @@ function mCustom(){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
-      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({tone:t, score:r.score, isAlt:t.id!==primary.id});
       $('#result').innerHTML='<hr style="margin:20px 0 18px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -5420,7 +5817,7 @@ function mToneLab(arg){
       var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
       if(S.raw().prefs.hardMode) r.score=Math.max(0, Math.round(r.score*0.88));
-      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       S.noteMetric('span', a.span); S.noteMetric('term', a.term);
       D.results.push({tone:t, score:r.score});
       $('#result').innerHTML=
@@ -5429,7 +5826,7 @@ function mToneLab(arg){
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score, t)+'</p>'+
         '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · mastery on '+esc(t.name)+' now '+S.masteryOf(t.id)+'%'+
         (r.personalised?' · <span style="color:var(--cy)">personal bands</span>':'')+'</p></div></div>'+
-        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins);
+        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins)+fairnessStrip(t, r.score, a);
       $('#recNote').textContent='Press R to redo, → for next.';
       if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
     }, {maxSec:22});
@@ -5930,7 +6327,7 @@ function mScript(arg){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, t, UI.words(sc.lines[D.i][1]), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({score:r.score, tone:t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -5969,7 +6366,7 @@ function mRoulette(){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(it.t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      S.recordRep(it.t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({score:r.score, tone:it.t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -6209,7 +6606,7 @@ function mCold(){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.txt), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(it.t.id, r.score, {wpm:r.wpm,span:a.span,term:a.term,floorDrop:a.floorDrop,baseHz:a.baseline});
+      S.recordRep(it.t.id, r.score, {wpm:r.wpm,span:a.span,term:a.term,floorDrop:a.floorDrop,baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({score:r.score, tone:it.t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -7236,6 +7633,310 @@ UI.registerView('progress:act', function(a){
 
 <script>
 /* ============================================================
+   CLOUD VIEWS — account gate, admin dashboard, feedback
+   ============================================================ */
+'use strict';
+
+(function(){
+var esc=UI.esc, $=UI.$;
+
+/* ---------- account / sign in ---------- */
+var AUTH = {mode:'in', busy:false, err:'', f:{email:'',pin:'',username:'',fullName:'',phone:''}};
+
+UI.registerView('account', function(){
+  if(!Cloud.configured()) return '<div class="page"><div class="phead"><h1>Accounts are off</h1>'+
+    '<p class="lede">No backend is configured for this build, so everything stays local to this browser.</p></div></div>';
+
+  if(Cloud.signedIn()){
+    var m=Cloud.me(), p=m.profile||{}, s=S.raw();
+    var mins=Math.round(Cloud.totalSeconds()/60);
+    return '<div class="page">'+
+    '<div class="phead"><p class="kick">Signed in</p><h1>'+esc(p.full_name||p.username||p.email||'Your account')+'</h1>'+
+    '<p class="lede">Your progress syncs across every device you sign in on. Audio is never uploaded — only the derived numbers.</p></div>'+
+    '<div class="grid g4" style="margin-bottom:22px">'+
+    '<div class="stat"><p class="k">Username</p><div class="v" style="font-size:16px">'+esc(p.username||'—')+'</div></div>'+
+    '<div class="stat"><p class="k">Role</p><div class="v" style="font-size:16px">'+esc(p.role||'rep')+'</div></div>'+
+    '<div class="stat cy"><p class="k">Time trained</p><div class="v">'+mins+'<span style="font-size:14px;color:var(--muted)">m</span></div></div>'+
+    '<div class="stat acc"><p class="k">Synced reps</p><div class="v">'+(s.reps||0)+'</div></div></div>'+
+    '<div class="card"><p class="lbl" style="margin-bottom:10px">Account</p>'+
+    '<div class="prose" style="font-size:14px"><table>'+
+    '<tr><td>Email</td><td>'+esc(p.email||'')+'</td></tr>'+
+    '<tr><td>Name</td><td>'+esc(p.full_name||'—')+'</td></tr>'+
+    '<tr><td>Phone</td><td>'+esc(p.phone||'—')+'</td></tr>'+
+    '<tr><td>Team</td><td>'+esc(p.org||'—')+'</td></tr></table></div>'+
+    '<div class="row" style="margin-top:14px"><button class="btn sec" data-act="sync">Sync now</button>'+
+    '<button class="btn gh" data-act="out">Sign out</button></div></div>'+
+    (Cloud.isAdmin()?'<div class="note vi" style="margin-top:14px"><span class="l">You are an admin</span>'+
+     'Use the toggle at the top of the sidebar to switch between your own training view and the team dashboard.</div>':'')+
+    '</div>';
+  }
+
+  var f=AUTH.f, signUp=AUTH.mode==='up';
+  return '<div class="page" style="max-width:560px">'+
+  '<div class="phead"><p class="kick">'+(signUp?'Create your account':'Welcome back')+'</p>'+
+  '<h1>'+(signUp?'Join the gym':'Sign in')+'</h1>'+
+  '<p class="lede">'+(signUp
+    ? 'No verification email, no code to wait for. Fill this in and you are training in about twenty seconds.'
+    : 'Your progress, voice profile and history follow you to any device.')+'</p></div>'+
+
+  (AUTH.err?'<div class="note no"><span class="l">Could not continue</span>'+esc(AUTH.err)+'</div>':'')+
+
+  '<div class="card">'+
+  (signUp?
+    '<div class="f" style="margin-bottom:13px"><label class="lbl">Full name</label>'+
+    '<input type="text" id="auName" value="'+esc(f.fullName)+'" placeholder="Jordan Blake" autocomplete="name"></div>'+
+    '<div class="f" style="margin-bottom:13px"><label class="lbl">Username</label>'+
+    '<input type="text" id="auUser" value="'+esc(f.username)+'" placeholder="jordanb" autocomplete="username"></div>'+
+    '<div class="f" style="margin-bottom:13px"><label class="lbl">Phone</label>'+
+    '<input type="text" id="auPhone" value="'+esc(f.phone)+'" placeholder="+1 555 010 9988" autocomplete="tel"></div>'
+  :'')+
+  '<div class="f" style="margin-bottom:13px"><label class="lbl">Email</label>'+
+  '<input type="text" id="auEmail" value="'+esc(f.email)+'" placeholder="you@company.com" autocomplete="email"></div>'+
+  '<div class="f" style="margin-bottom:6px"><label class="lbl">6-digit PIN</label>'+
+  '<input type="password" id="auPin" value="'+esc(f.pin)+'" placeholder="••••••" inputmode="numeric" maxlength="6" '+
+  'autocomplete="'+(signUp?'new-password':'current-password')+'" style="letter-spacing:.4em;font-size:18px"></div>'+
+  '<p class="tiny dim" style="margin:0 0 16px">Six digits. '+(signUp?'Do not reuse a PIN you use for your phone or your bank.':'')+'</p>'+
+  '<button class="btn blk big" data-act="go"'+(AUTH.busy?' disabled':'')+'>'+
+    (AUTH.busy?'Working…':(signUp?'Create account & start':'Sign in'))+'</button>'+
+  '<button class="btn gh blk sm" data-act="mode" style="margin-top:9px">'+
+    (signUp?'I already have an account':'I need to create an account')+'</button>'+
+  '</div>'+
+
+  (signUp?'<div class="note" style="margin-top:14px"><span class="l">What gets stored, plainly</span>'+
+   '<b>Never your audio.</b> Recording happens in your browser and stays there. What syncs is the derived numbers — '+
+   'your scores, your pace, your pitch range, which drills you did and how long you trained.<br><br>'+
+   '<b>Your manager can see your training data.</b> Scores, activity, weak tones and time spent. That is the point of it — '+
+   'it is a coaching tool. You are seeing this before you sign up so it is never a surprise.</div>':'')+
+
+  '<div class="row" style="margin-top:16px"><button class="btn gh sm" data-go="home">Skip — train without an account</button></div>'+
+  '<p class="tiny dim" style="margin-top:8px">Without an account everything still works, but progress lives only in this browser and is lost if you clear it.</p>'+
+  '</div>';
+});
+
+UI.registerView('account:act', function(a){
+  if(a==='mode'){ AUTH.mode = AUTH.mode==='up'?'in':'up'; AUTH.err=''; UI.render(); return; }
+  if(a==='out'){ Cloud.signOut().then(function(){ UI.toast('Signed out'); UI.go('home'); }); return; }
+  if(a==='sync'){ Cloud.pushAll(true).then(function(){ UI.toast('Synced'); }); return; }
+  if(a==='go'){
+    var f=AUTH.f;
+    f.email=($('#auEmail')||{}).value||''; f.pin=($('#auPin')||{}).value||'';
+    if($('#auName'))  f.fullName=$('#auName').value;
+    if($('#auUser'))  f.username=$('#auUser').value;
+    if($('#auPhone')) f.phone=$('#auPhone').value;
+
+    if(!/\S+@\S+\.\S+/.test(f.email)){ AUTH.err='That email does not look right.'; UI.render(); return; }
+    if(!/^\d{6}$/.test(f.pin)){ AUTH.err='Your PIN must be exactly 6 digits.'; UI.render(); return; }
+
+    AUTH.busy=true; AUTH.err=''; UI.render();
+    var p = AUTH.mode==='up' ? Cloud.signUp(f) : Cloud.signIn(f.email, f.pin);
+    p.then(function(){
+      AUTH.busy=false; AUTH.f={email:'',pin:'',username:'',fullName:'',phone:''};
+      UI.toast('Signed in'); UI.go('home');
+    }).catch(function(e){
+      AUTH.busy=false;
+      var m=(e&&e.message)||'Something went wrong.';
+      if(/already registered|already exists/i.test(m)) m='That email already has an account — switch to sign in.';
+      if(/Invalid login/i.test(m)) m='Email or PIN not recognised.';
+      AUTH.err=m; UI.render();
+    });
+  }
+});
+
+/* ---------- admin dashboard ---------- */
+var TEAM = {data:null, loading:false, tried:false, sort:'reps_7d', person:null};
+
+UI.registerView('admin', function(){
+  if(!Cloud.isAdmin()) return '<div class="page"><div class="phead"><h1>Admins only</h1>'+
+    '<p class="lede">This view is for team accounts with the admin role.</p>'+
+    '<p class="lede" style="margin-top:10px">If that should be you, run this once in the Supabase SQL editor:<br>'+
+    '<code style="display:inline-block;margin-top:8px">update public.profiles set role = \'admin\' where email = \'you@company.com\';</code></p></div></div>';
+
+  // fetch exactly once per visit — never re-fire from inside render
+  if(!TEAM.data && !TEAM.loading && !TEAM.tried){
+    TEAM.loading=true; TEAM.tried=true;
+    Cloud.team().then(function(d){ TEAM.data=d; TEAM.loading=false; UI.render(); })
+                .catch(function(){ TEAM.loading=false; UI.render(); });
+  }
+  if(TEAM.loading) return '<div class="page"><div class="empty"><div class="ei">◴</div><p>Loading the team…</p></div></div>';
+  if(!TEAM.data) return '<div class="page"><div class="phead"><h1>Could not load the team</h1>'+
+    '<p class="lede">The dashboard needs a live connection to Supabase and an admin role on your account. '+
+    'If you are offline this will simply not work — everything else in the app still does.</p></div>'+
+    '<button class="btn" data-act="retry">Try again</button></div>';
+
+  var d=TEAM.data;
+  if(TEAM.person) return personView(d, TEAM.person);
+
+  var people=d.people.slice().sort(function(a,b){ return (b[TEAM.sort]||0)-(a[TEAM.sort]||0); });
+  var active=people.filter(function(p){return (p.reps_7d||0)>0;}).length;
+  var totalReps=people.reduce(function(s,p){return s+(p.reps||0);},0);
+  var avg=people.filter(function(p){return p.avg_30d;});
+  var teamAvg=avg.length?Math.round(avg.reduce(function(s,p){return s+ +p.avg_30d;},0)/avg.length):null;
+
+  // team-wide weak tones
+  var byTone={};
+  d.weak.forEach(function(w){
+    var t=byTone[w.tone]=byTone[w.tone]||{n:0,sum:0,people:0};
+    t.n+=w.n; t.sum+= (+w.avg_score)*w.n; t.people++;
+  });
+  var weakest=Object.keys(byTone).map(function(k){
+    return {tone:k, avg:Math.round(byTone[k].sum/byTone[k].n), n:byTone[k].n, people:byTone[k].people};
+  }).filter(function(x){ return TONE_BY_ID[x.tone]; }).sort(function(a,b){return a.avg-b.avg;}).slice(0,6);
+
+  return '<div class="page wide">'+
+  '<div class="phead"><p class="kick">Admin · '+people.length+' account'+(people.length===1?'':'s')+'</p>'+
+  '<h1>Team</h1><p class="lede">Who is actually training, what they are weak at, and what the app is getting wrong. '+
+  'Click anyone for their detail.</p></div>'+
+
+  '<div class="grid g4" style="margin-bottom:24px">'+
+  '<div class="stat '+(active?'ok':'no')+'"><p class="k">Active this week</p><div class="v">'+active+'<span style="font-size:15px;color:var(--muted)">/'+people.length+'</span></div><p class="s">did at least one rep</p></div>'+
+  '<div class="stat cy"><p class="k">Total reps</p><div class="v">'+totalReps.toLocaleString()+'</div><p class="s">all time</p></div>'+
+  '<div class="stat '+(teamAvg>=75?'ok':teamAvg>=60?'acc':'no')+'"><p class="k">Team avg score</p><div class="v">'+(teamAvg||'—')+'</div><p class="s">last 30 days</p></div>'+
+  '<div class="stat"><p class="k">Signals to review</p><div class="v">'+(d.fairness.length+d.misses.length+d.feedback.length)+'</div><p class="s">flags, misses, feedback</p></div>'+
+  '</div>'+
+
+  '<div class="sect" style="margin-top:0"><div class="shead"><h2>People</h2>'+
+  '<div class="seg" id="teamSort" style="margin-left:auto">'+
+  [['reps_7d','This week'],['reps','All time'],['avg_30d','Avg score'],['level','Level']].map(function(o){
+    return '<button data-s="'+o[0]+'"'+(TEAM.sort===o[0]?' class="on"':'')+'>'+o[1]+'</button>'; }).join('')+
+  '</div></div>'+
+  '<div class="grid" style="gap:7px">'+people.map(function(p){
+    var mins=Math.round((((p.payloadSeconds||0))/60));
+    var stale=!(p.reps_7d>0);
+    return '<button class="tw" style="width:100%;text-align:left;cursor:pointer;'+(stale?'opacity:.62':'')+'" data-act="person" data-arg="'+esc(p.id)+'">'+
+      '<div style="flex:1;min-width:0">'+
+      '<div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap">'+
+      '<b style="font-size:14.5px">'+esc(p.full_name||p.username||p.email||'—')+'</b>'+
+      (p.role==='admin'?'<span class="chip tiny vi">admin</span>':'')+
+      (stale?'<span class="chip tiny no">nothing this week</span>':'<span class="chip tiny ok">'+p.reps_7d+' reps this week</span>')+
+      '</div>'+
+      '<div class="meta" style="margin-top:5px">'+
+      '<span class="mono tiny dim">L'+(p.level||1)+' · '+(p.reps||0)+' reps · '+(p.streak||0)+'d streak'+
+      (p.avg_30d?' · avg '+p.avg_30d:'')+
+      (p.avg_term_30d?' · term '+(+p.avg_term_30d>0?'+':'')+p.avg_term_30d+'st':'')+
+      (p.avg_span_30d?' · range '+p.avg_span_30d+'st':'')+'</span></div></div>'+
+      '<span class="tiny dim" style="flex:none">›</span></button>';
+  }).join('')+'</div></div>'+
+
+  (weakest.length?'<div class="sect"><div class="shead"><h2>Where the team is weakest</h2>'+
+   '<span class="n">30 days · 3+ reps each</span></div>'+
+   '<p class="sdesc">Lowest average score across everyone. This is your next group session.</p>'+
+   '<div class="grid gauto">'+weakest.map(function(w){
+     var t=TONE_BY_ID[w.tone];
+     return '<div class="card" style="padding:14px 16px"><div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px">'+
+       '<b style="font-size:14.5px;color:'+FAMILIES[t.fam].c+'">'+esc(t.name)+'</b>'+
+       '<span class="mono tiny '+(w.avg<60?'':'dim')+'" style="color:'+(w.avg<60?'var(--no)':'')+'">'+w.avg+'</span></div>'+
+       '<div class="meter '+(w.avg>=75?'ok':w.avg>=60?'':'no')+'"><i style="width:'+w.avg+'%"></i></div>'+
+       '<p class="tiny dim" style="margin:7px 0 0">'+w.people+' '+(w.people===1?'person':'people')+' · '+w.n+' reps</p></div>';
+   }).join('')+'</div></div>':'')+
+
+  signalsBlock(d)+
+  '</div>';
+});
+
+function signalsBlock(d){
+  function rows(list, render){
+    if(!list.length) return '<p class="tiny dim">Nothing yet.</p>';
+    return '<div class="grid" style="gap:7px">'+list.slice(0,12).map(render).join('')+'</div>';
+  }
+  var who={}; (TEAM.data.people||[]).forEach(function(p){ who[p.id]=p.full_name||p.username||p.email||'someone'; });
+  return '<div class="sect"><div class="shead"><h2>What the app is getting wrong</h2>'+
+  '<span class="n">the feedback loop</span></div>'+
+  '<p class="sdesc">This is the material that makes the engine better. Send it over and it becomes new rules and recalibrated thresholds.</p>'+
+
+  '<div class="grid g3" style="gap:14px;align-items:start">'+
+  '<div class="card"><p class="lbl" style="margin-bottom:9px;color:var(--no)">Unfair scores ('+d.fairness.length+')</p>'+
+  rows(d.fairness, function(f){
+    return '<div style="padding:8px 0;border-top:1px solid var(--line)">'+
+    '<p class="tiny" style="margin:0 0 2px"><b>'+esc(who[f.user_id]||'—')+'</b> · '+esc(f.verdict.replace('_',' '))+'</p>'+
+    '<p class="tiny dim" style="margin:0">'+esc(TONE_BY_ID[f.tone]?TONE_BY_ID[f.tone].name:f.tone||'')+' scored '+(f.score==null?'—':f.score)+
+    (f.note?' — “'+esc(f.note.slice(0,70))+'”':'')+'</p></div>';
+  })+'</div>'+
+
+  '<div class="card"><p class="lbl" style="margin-bottom:9px;color:var(--cy)">Advisor misses ('+d.misses.length+')</p>'+
+  rows(d.misses, function(m){
+    return '<div style="padding:8px 0;border-top:1px solid var(--line)">'+
+    '<p class="tiny" style="margin:0 0 2px"><b>'+esc(who[m.user_id]||'—')+'</b> · '+esc(m.stage||'')+'</p>'+
+    '<p class="tiny dim" style="margin:0">“'+esc((m.line||'').slice(0,60))+'” → '+
+    esc(TONE_BY_ID[m.recommended]?TONE_BY_ID[m.recommended].name:m.recommended||'')+'</p></div>';
+  })+'</div>'+
+
+  '<div class="card"><p class="lbl" style="margin-bottom:9px;color:var(--acc)">Feedback ('+d.feedback.length+')</p>'+
+  rows(d.feedback, function(f){
+    return '<div style="padding:8px 0;border-top:1px solid var(--line)">'+
+    '<p class="tiny" style="margin:0 0 2px"><b>'+esc(who[f.user_id]||'—')+'</b> · '+esc(f.page||'')+'</p>'+
+    '<p class="tiny dim" style="margin:0">'+esc((f.message||'').slice(0,110))+'</p></div>';
+  })+'</div></div></div>';
+}
+
+function personView(d, id){
+  var p=d.people.filter(function(x){return x.id===id;})[0];
+  if(!p) return '<div class="page"><div class="empty"><p>Not found.</p></div></div>';
+  var weak=d.weak.filter(function(w){return w.user_id===id;}).sort(function(a,b){return a.avg_score-b.avg_score;});
+  var reps=d.reps.filter(function(r){return r.user_id===id;});
+  var byDrill={}; reps.forEach(function(r){ if(r.drill) byDrill[r.drill]=(byDrill[r.drill]||0)+1; });
+  var drills=Object.keys(byDrill).sort(function(a,b){return byDrill[b]-byDrill[a];});
+
+  return '<div class="page wide">'+
+  '<button class="btn gh sm" data-act="back" style="margin-bottom:18px">← Team</button>'+
+  '<div class="phead"><p class="kick">'+esc(p.email||'')+'</p><h1>'+esc(p.full_name||p.username||'—')+'</h1></div>'+
+
+  '<div class="grid g4" style="margin-bottom:22px">'+
+  '<div class="stat acc"><p class="k">Level</p><div class="v">'+(p.level||1)+'</div><p class="s">'+(p.xp||0)+' xp</p></div>'+
+  '<div class="stat '+((p.reps_7d||0)>0?'ok':'no')+'"><p class="k">This week</p><div class="v">'+(p.reps_7d||0)+'</div><p class="s">reps · '+(p.reps||0)+' all time</p></div>'+
+  '<div class="stat"><p class="k">Streak</p><div class="v">'+(p.streak||0)+'<span style="font-size:14px;color:var(--muted)">d</span></div></div>'+
+  '<div class="stat '+(p.avg_30d>=75?'ok':p.avg_30d>=60?'acc':'no')+'"><p class="k">Avg score</p><div class="v">'+(p.avg_30d||'—')+'</div><p class="s">30 days</p></div>'+
+  '</div>'+
+
+  (p.modal_hz?'<div class="card" style="margin-bottom:14px"><p class="lbl" style="margin-bottom:10px">Their voice</p>'+
+   '<div class="readout">'+
+   '<div class="ro"><p class="k">Modal pitch</p><div class="v" style="font-size:18px">'+Math.round(p.modal_hz)+'<span class="u">Hz</span></div></div>'+
+   (p.flat_span?'<div class="ro"><p class="k">Flat</p><div class="v" style="font-size:18px">'+(+p.flat_span).toFixed(1)+'<span class="u">st</span></div><p class="t">their floor</p></div>':'')+
+   (p.nat_span?'<div class="ro warn"><p class="k">Natural</p><div class="v" style="font-size:18px">'+(+p.nat_span).toFixed(1)+'<span class="u">st</span></div></div>':'')+
+   (p.ceil_span?'<div class="ro good"><p class="k">Ceiling</p><div class="v" style="font-size:18px">'+(+p.ceil_span).toFixed(1)+'<span class="u">st</span></div></div>':'')+
+   (p.avg_term_30d?'<div class="ro '+(+p.avg_term_30d<=-2?'good':'bad')+'"><p class="k">Avg terminal</p><div class="v" style="font-size:18px">'+(+p.avg_term_30d>0?'+':'')+(+p.avg_term_30d).toFixed(1)+'<span class="u">st</span></div><p class="t">negative = falling</p></div>':'')+
+   '</div>'+
+   (p.flat_span && p.ceil_span && p.nat_span ?
+     '<p class="tiny dim2" style="margin:12px 0 0">They demonstrated <b style="color:var(--ink)">'+((+p.ceil_span)-(+p.flat_span)).toFixed(1)+' semitones</b> of range on demand '+
+     'and use about <b style="color:var(--ink)">'+Math.round(((+p.nat_span)-(+p.flat_span))/Math.max(0.5,(+p.ceil_span)-(+p.flat_span))*100)+'%</b> of it when they talk normally. '+
+     'That gap is the coaching conversation.</p>':'')+
+   '</div>':'<div class="note acc" style="margin-bottom:14px"><span class="l">Not calibrated</span>They have not run voice calibration, so their scores are measured against population defaults rather than their own floor. Worth getting them to do it — it takes two minutes.</div>')+
+
+  '<div class="split">'+
+  '<div>'+
+  (weak.length?'<div class="sect" style="margin-top:0"><div class="shead"><h2>Weakest tones</h2><span class="n">30 days</span></div>'+
+   '<div class="grid" style="gap:6px">'+weak.slice(0,10).map(function(w){
+     var t=TONE_BY_ID[w.tone]; if(!t) return '';
+     return '<div style="display:flex;align-items:center;gap:11px">'+
+       '<span style="flex:0 0 165px;font-size:13px;color:'+FAMILIES[t.fam].c+'">'+esc(t.name)+'</span>'+
+       '<div class="meter '+(w.avg_score>=75?'ok':w.avg_score>=60?'':'no')+'" style="flex:1"><i style="width:'+w.avg_score+'%"></i></div>'+
+       '<span class="mono tiny dim" style="width:64px;text-align:right">'+w.avg_score+' · '+w.n+'r</span></div>';
+   }).join('')+'</div></div>':'<p class="dim">Not enough scored reps yet to rank their weak tones.</p>')+
+  '</div>'+
+  '<div>'+
+  (drills.length?'<div class="card"><p class="lbl" style="margin-bottom:10px">Drills they actually do</p>'+
+   drills.slice(0,10).map(function(k){
+     var m=MODULES.filter(function(x){return x.id===k;})[0];
+     return '<div style="display:flex;justify-content:space-between;padding:6px 0;border-top:1px solid var(--line);font-size:13px">'+
+       '<span class="dim2">'+esc(m?m.n:k)+'</span><span class="mono dim">'+byDrill[k]+'</span></div>';
+   }).join('')+'</div>':'')+
+  '</div></div></div>';
+}
+
+UI.registerView('admin:act', function(a, arg){
+  if(a==='person'){ TEAM.person=arg; UI.render(); UI.$('#main').scrollTop=0; }
+  if(a==='back'){ TEAM.person=null; UI.render(); }
+  if(a==='retry'){ TEAM.tried=false; TEAM.data=null; UI.render(); }
+});
+UI.registerView('admin:after', function(){
+  var s=$('#teamSort');
+  if(s) s.onclick=function(e){ var b=e.target.closest('[data-s]'); if(b){ TEAM.sort=b.dataset.s; UI.render(); } };
+});
+
+})();
+</script>
+
+<script>
+/* ============================================================
    BOOT
    ============================================================ */
 (function(){
@@ -7244,6 +7945,14 @@ UI.registerView('progress:act', function(a){
 // theme from saved prefs
 var pref=S.raw().prefs.theme;
 document.documentElement.setAttribute('data-theme', pref==='light'?'light':'dark');
+
+// bring the cloud up in the background — the app never waits on it
+if(window.Cloud && Cloud.configured()){
+  Cloud.on(function(){ UI.paintHud(); UI.render(); });
+  Cloud.boot().then(function(ok){
+    if(ok && Cloud.signedIn()) UI.toast('Signed in — progress syncing');
+  });
+}
 
 // route from hash
 var h=location.hash.replace('#','');

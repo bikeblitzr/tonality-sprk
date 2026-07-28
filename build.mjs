@@ -1,0 +1,10 @@
+import fs from 'fs';
+import path from 'path';
+const dir='src';
+const files=fs.readdirSync(dir).filter(f=>/\.(html|js)$/.test(f)).sort();
+let out='';
+for(const f of files) out += fs.readFileSync(path.join(dir,f),'utf8') + '\n';
+fs.writeFileSync('index.html', out);
+const kb=(Buffer.byteLength(out)/1024).toFixed(1);
+console.log('built index.html · '+kb+' KB from '+files.length+' parts:');
+files.forEach(f=>console.log('   '+f));

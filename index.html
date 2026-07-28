@@ -3312,12 +3312,38 @@ function bandScore(v, band, tolerance){
 function personalBands(tone){
   var P=PROFILE;
   if(!P || !P.natural) return null;
-  var N=P.natural, T=tone.target;
+  var T=tone.target, F=P.flat, E=P.expressive, N=P.natural;
+
+  // With a three-point profile we can do this properly: anchor the band on
+  // where THIS speaker's floor actually is, and scale it by the range they
+  // demonstrably have on demand. A person whose flat already carries 6 st
+  // and one whose flat carries 2 st should not be handed the same target.
+  if(F && E && E.span > F.span + 0.5){
+    var travel = E.span - F.span;
+    var stdMid = (T.span[0]+T.span[1])/2, stdHalf = (T.span[1]-T.span[0])/2;
+    // where the standard band sits as a fraction of a typical 8-st travel,
+    // re-expressed against this speaker's own travel
+    var frac = Math.max(0.35, Math.min(1.0, stdMid/8));
+    var centre = F.span + travel*frac;
+    var half = Math.max(1.2, stdHalf * (travel/8));
+    var spanBand = [ +(centre-half).toFixed(1), +(centre+half).toFixed(1) ];
+    // never let the personal floor fall at or below their flat — that would
+    // score them as engaged while they are doing nothing
+    spanBand[0] = Math.max(spanBand[0], +(F.span + travel*0.28).toFixed(1));
+    spanBand[1] = Math.max(spanBand[1], spanBand[0]+1.5);
+    return {
+      wpm:  shift(T.wpm,  N.wpm,  1,    70, 240),
+      span: [Math.max(2.5, spanBand[0]), Math.min(20, spanBand[1])],
+      term: T.term,
+      dyn:  shift(T.dyn,  (F.dyn!=null? F.dyn + Math.max(0,(E.dyn-F.dyn))*0.55 : N.dyn), 1, 2, 22),
+      pause:shift(T.pause, N.pauseFrac, 1.05, 5, 55)
+    };
+  }
+
+  // fallback: older profiles that only captured a single natural read
   function shift(band, natural, stretch, floor, ceil){
     if(natural==null) return band;
     var mid=(band[0]+band[1])/2;
-    // move the standard band a third of the way toward this speaker's
-    // own habit, then push it up by the stretch factor
     var lo = band[0] + (natural-mid)*0.33;
     var hi = band[1] + (natural-mid)*0.33;
     lo*=stretch; hi*=stretch;
@@ -3332,21 +3358,35 @@ function personalBands(tone){
   };
 }
 
-/* how far this rep sits above the speaker's own calibration baseline */
+/* How far this rep sits above the speaker's own FLOOR.
+   Flat is the honest zero point — "you added 3.2 semitones over your own
+   flat" means something, where "your span was 5.1" does not, because 5.1
+   is engaged for one person and disengaged for another.               */
 function vsBaseline(a, W){
   var P=PROFILE;
   if(!P || !P.natural) return null;
-  var N=P.natural, out=[];
-  if(N.span!=null)  out.push({k:'Range',    d:a.span - N.span,        u:'st', better:'up'});
-  if(N.dyn!=null)   out.push({k:'Dynamics', d:a.dyn  - N.dyn,         u:'dB', better:'up'});
-  if(N.term!=null)  out.push({k:'Terminal', d:N.term - a.term,        u:'st', better:'up'});
-  if(N.pauseFrac!=null) out.push({k:'Silence', d:a.pauseFrac-N.pauseFrac, u:'%', better:'up'});
-  if(N.floorDrop!=null) out.push({k:'Held to end', d:N.floorDrop-a.floorDrop, u:'dB', better:'up'});
-  return out.map(function(x){
-    x.d = +x.d.toFixed(1);
-    x.good = x.d > 0.4;
-    return x;
-  });
+  var base = P.flat || P.natural;
+  var ref  = P.flat ? 'flat' : 'baseline';
+  var out=[];
+  if(base.span!=null)  out.push({k:'Range',    d:a.span - base.span,   u:'st', ref:ref});
+  if(base.dyn!=null)   out.push({k:'Dynamics', d:a.dyn  - base.dyn,    u:'dB', ref:ref});
+  if(base.term!=null)  out.push({k:'Terminal', d:base.term - a.term,   u:'st', ref:ref});
+  if(base.pauseFrac!=null) out.push({k:'Silence', d:a.pauseFrac-base.pauseFrac, u:'%', ref:ref});
+  if(base.floorDrop!=null) out.push({k:'Held to end', d:base.floorDrop-a.floorDrop, u:'dB', ref:ref});
+  var rows = out.map(function(x){ x.d=+x.d.toFixed(1); x.good = x.d > 0.4; return x; });
+
+  // headroom: how much of their demonstrated range this rep actually used
+  if(P.flat && P.expressive){
+    var travel = Math.max(0.5, P.expressive.span - P.flat.span);
+    var used = (a.span - P.flat.span) / travel * 100;
+    rows.headroom = {
+      pct: Math.round(Math.max(0, Math.min(140, used))),
+      travel: +travel.toFixed(1),
+      flat: +P.flat.span.toFixed(1),
+      ceil: +P.expressive.span.toFixed(1)
+    };
+  }
+  return rows;
 }
 
 function scoreAgainstTone(a, tone, wordCount, usePersonal){
@@ -4423,15 +4463,25 @@ function playback(){
    the standard score rather than instead of it. Two honest numbers. */
 function baselineStrip(r){
   if(!r || !r.vsBase || !r.vsBase.length) return '';
+  var hr=r.vsBase.headroom;
+  var lbl = r.vsBase[0] && r.vsBase[0].ref==='flat' ? 'vs your flat — your own floor' : 'vs your calibration baseline';
   return '<div style="margin:12px 0 0">'+
-    '<p class="lbl" style="margin-bottom:7px;color:var(--cy)">vs your calibration baseline</p>'+
+    '<p class="lbl" style="margin-bottom:7px;color:var(--cy)">'+lbl+'</p>'+
     '<div class="readout">'+r.vsBase.map(function(x){
       var sign = x.d>0?'+':'';
       return '<div class="ro '+(x.good?'good':'')+'" style="'+(x.good?'':'opacity:.75')+'">'+
         '<p class="k">'+esc(x.k)+'</p>'+
         '<div class="v" style="font-size:17px">'+sign+x.d+'<span class="u">'+esc(x.u)+'</span></div>'+
-        '<p class="t">'+(x.good?'above your baseline':x.d<-0.4?'below it':'about the same')+'</p></div>';
-    }).join('')+'</div></div>';
+        '<p class="t">'+(x.good?'above your flat':x.d<-0.4?'below it':'about the same')+'</p></div>';
+    }).join('')+'</div>'+
+    (hr? '<div style="margin-top:10px">'+
+      '<div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:5px">'+
+      '<span class="dim2">Range you deployed — of the '+hr.travel+' st you demonstrated on demand</span>'+
+      '<span class="mono '+(hr.pct>=70?'':'dim')+'" style="color:'+(hr.pct>=70?'var(--ok)':hr.pct>=40?'var(--acc)':'var(--muted)')+'">'+hr.pct+'%</span></div>'+
+      '<div class="meter '+(hr.pct>=70?'ok':'')+'"><i style="width:'+Math.min(100,hr.pct)+'%"></i></div>'+
+      '<p class="tiny dim" style="margin:6px 0 0">Your flat sits at '+hr.flat+' st, your ceiling at '+hr.ceil+' st. '+
+      (hr.pct>=70?'You are using most of what you have.':hr.pct>=40?'Room to push further — the capacity is already there.':'You have far more range available than you are using here. That is a deployment habit, not a limit.')+'</p></div>':'')+
+    '</div>';
 }
 
 function toneChip(t){ return '<span class="tone">'+esc(t.name)+'</span>'; }
@@ -4456,28 +4506,31 @@ function unlockedTones(){ return TONES.filter(function(t){ return S.tierUnlocked
    MODE: VOICE CALIBRATION
    Teaches the engine this specific voice and this specific room.
    ============================================================ */
-var CAL_NATURAL = 'The meeting is on Thursday morning, and I told them we would have the numbers ready by then.';
-var CAL_SIBILANT = 'Say a long "ssssss" for about two seconds. Then pause. Then a long "shhhhh" for about two seconds.';
+/* One sentence, read three ways. Deliberately neutral in content so no
+   emotional colour leaks in and contaminates the measurement, and the
+   SAME sentence every time so the three reads are directly comparable. */
+var CAL_LINE = 'The meeting is on Thursday morning, and I told them we would have the numbers ready by then.';
 
 function mCalibrate(arg){
   var isRedo = arg==='redo';
   var R = {};   // results accumulate here
   var STEPS = [
     {id:'intro'},
-    {id:'noise'}, {id:'sustain'}, {id:'glide'}, {id:'sibilant'}, {id:'natural'},
+    {id:'noise'}, {id:'sustain'}, {id:'glide'}, {id:'sibilant'},
+    {id:'flat'}, {id:'natural'}, {id:'expressive'},
     {id:'done'}
   ];
+  var NSTEPS = 7;
   D={i:0};
-  open('Voice Calibration', STEPS.length-2);
+  open('Voice Calibration', NSTEPS);
 
   function draw(){
     var st=STEPS[D.i];
     if(!st) return finish();
-    ({intro:sIntro, noise:sNoise, sustain:sSustain, glide:sGlide,
-      sibilant:sSibilant, natural:sNatural, done:finish})[st.id]();
-    D.total = STEPS.length-2;
-    D.i2 = Math.max(0, D.i-1);
-    $('#stPos').textContent = (st.id==='intro'||st.id==='done') ? '' : (D.i)+' / 5';
+    ({intro:sIntro, noise:sNoise, sustain:sSustain, glide:sGlide, sibilant:sSibilant,
+      flat:sFlat, natural:sNatural, expressive:sExpressive, done:finish})[st.id]();
+    D.total = NSTEPS;
+    $('#stPos').textContent = (st.id==='intro'||st.id==='done') ? '' : (D.i)+' / '+NSTEPS;
     $('#stProg').style.width = ((D.i)/(STEPS.length-1)*100)+'%';
   }
   D.next=function(){ D.i++; draw(); };
@@ -4629,29 +4682,62 @@ function mCalibrate(arg){
     }, {maxSec:9, spectra:true});
   }
 
-  /* ---------- 5 · natural speech ---------- */
-  function sNatural(){
-    step(5,'How you actually talk',
-      esc(CAL_NATURAL),
-      'Read it the way you would say it to a colleague. Not performed, not careful — normal. This becomes your personal baseline, so a flat read here makes every later comparison look better than it is.');
-    hint('Normal voice. This is the one step where trying hard makes the measurement worse.');
-    foot('Finish →');
+  /* ---------- 5,6,7 · the same sentence, three ways ----------
+     This is the heart of it. Flat is not the same number for everyone —
+     one person's completely unemphasised speech already carries six
+     semitones, another's carries two. Measuring the FLOOR is what makes
+     everything above it meaningful.                                    */
+  function readStep(n, key, title, instruction, why, hintTxt, tone){
+    step(n, title, instruction, why,
+      '<p class="utter xs" style="margin:0 0 14px;color:var(--ink)">“'+esc(CAL_LINE)+'”</p>');
+    hint(hintTxt);
+    foot(n===7?'Finish →':'Next →');
     wireRecorder(function(a){
-      var n=Audio.analyseNatural(a, UI.words(CAL_NATURAL));
-      if(!n){ $('#result').innerHTML='<div class="note no" style="margin-top:14px">Nothing captured. Try again.</div>'; return; }
-      R.natural=n;
+      var r=Audio.analyseNatural(a, UI.words(CAL_LINE));
+      if(!r){ $('#result').innerHTML='<div class="note no" style="margin-top:14px">Nothing captured. Try again.</div>'; return; }
+      R[key]=r;
+      var cmp='';
+      if(key==='natural' && R.flat){
+        var d=r.span-R.flat.span;
+        cmp='<div class="note '+(d>1.5?'ok':'')+'" style="margin-top:12px"><span class="l">Against your flat</span>'+
+          (d>0.4? 'You added <b>'+d.toFixed(1)+' semitones</b> of movement over your flat read. That gap is the thing this app trains.'
+                : 'Almost identical to your flat read ('+d.toFixed(1)+' st difference). Your conversational voice is running very close to your floor — which is normal, and it is exactly the gap the drills open up.')+'</div>';
+      }
+      if(key==='expressive' && R.flat){
+        var span=r.span-R.flat.span;
+        cmp='<div class="note ok" style="margin-top:12px"><span class="l">Your demonstrated range</span>'+
+          'From <b>'+R.flat.span.toFixed(1)+'</b> flat to <b>'+r.span.toFixed(1)+'</b> at full expression — <b>'+span.toFixed(1)+' semitones</b> of travel available to you on demand.'+
+          (R.natural? ' In normal conversation you use about <b>'+Math.round(Math.max(0,Math.min(100,(R.natural.span-R.flat.span)/Math.max(0.5,span)*100)))+'%</b> of it.' : '')+'</div>';
+      }
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         UI.readouts([
-          {k:'Your pace', v:Math.round(n.wpm), u:'wpm', s:0.8},
-          {k:'Your range', v:n.span.toFixed(1), u:'st', s:0.8},
-          {k:'Your terminal', v:(n.term>0?'+':'')+n.term.toFixed(1), u:'st', s:0.8},
-          {k:'Your dynamics', v:n.dyn.toFixed(1), u:'dB', s:0.8},
-          {k:'Your silence', v:Math.round(n.pauseFrac), u:'%', s:0.8}
-        ])+
-        '<div class="note cy" style="margin-top:12px"><span class="l">Saved as your baseline</span>'+
-        'None of these are scores. They are where you naturally sit, and every rep from now on will show you how far you have moved from them.</div>';
-      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2400);
-    }, {maxSec:22});
+          {k:'Pace', v:Math.round(r.wpm), u:'wpm', s:0.8},
+          {k:'Range', v:r.span.toFixed(1), u:'st', s:0.8},
+          {k:'Terminal', v:(r.term>0?'+':'')+r.term.toFixed(1), u:'st', s:0.8},
+          {k:'Dynamics', v:r.dyn.toFixed(1), u:'dB', s:0.8},
+          {k:'Silence', v:Math.round(r.pauseFrac), u:'%', s:0.8}
+        ])+cmp;
+      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, cmp?3000:2200);
+    }, {maxSec:24});
+  }
+
+  function sFlat(){
+    readStep(5,'flat','Your flat — the floor',
+      'Read it with <b>absolutely no expression</b>. Deliberately dull. Like you are reading a serial number out loud and would rather not be.',
+      'This is the measurement that makes all the others mean something. "Flat" is not the same number for everyone — a naturally melodic voice can be completely disengaged and still carry six semitones, while another voice sits at two. Without knowing <em>your</em> floor, every span figure afterwards is measured against a population average instead of against you.',
+      'Genuinely flat. Bored. If it sounds slightly wrong to say it this way, that is the correct amount of wrong.');
+  }
+  function sNatural(){
+    readStep(6,'natural','How you actually talk',
+      'Now the same sentence <b>the way you would really say it</b> to a colleague. Not performed, not careful — just normal.',
+      'Your habit. The gap between this and your flat read is how much expression you currently deploy without thinking about it, and that is the number the drills move.',
+      'Normal voice. This is the one step where trying hard makes the measurement worse.');
+  }
+  function sExpressive(){
+    readStep(7,'expressive','Your ceiling',
+      'Same sentence one more time, with <b>as much colour as you would ever use</b>. Push it further than feels comfortable.',
+      'Your demonstrated ceiling in actual speech — different from the glide, which measures singing range. The distance between your flat and this is your real working range, and how much of it you use day to day is the single most useful number in your profile.',
+      'Overdo it. Practice happens at the edges; performance lands at about sixty percent of them.');
   }
 
   /* ---------- done ---------- */
@@ -4684,10 +4770,29 @@ function mCalibrate(arg){
       (p.noiseDb!=null?row('Room noise floor', Math.round(p.noiseDb)+' dB', p.noiseDb<-54?'quiet':'some background'):'')+
       '</div>'+
 
+      (p.flat && p.expressive ? (function(){
+        var fl=p.flat, ex=p.expressive, na=n||fl;
+        var travel=Math.max(0.1, ex.span-fl.span);
+        var used=Math.max(0,Math.min(100,(na.span-fl.span)/travel*100));
+        return '<div class="card" style="margin-top:12px">'+
+        '<p class="lbl" style="margin-bottom:10px">Your three-point range — the important one</p>'+
+        '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:14px">'+
+        ['<div class="ro"><p class="k">Flat</p><div class="v" style="font-size:19px">'+fl.span.toFixed(1)+'<span class="u">st</span></div><p class="t">your floor</p></div>',
+         '<div class="ro warn"><p class="k">Natural</p><div class="v" style="font-size:19px">'+na.span.toFixed(1)+'<span class="u">st</span></div><p class="t">your habit</p></div>',
+         '<div class="ro good"><p class="k">Full colour</p><div class="v" style="font-size:19px">'+ex.span.toFixed(1)+'<span class="u">st</span></div><p class="t">your ceiling</p></div>'].join('')+
+        '</div>'+
+        '<div class="meter" style="height:9px"><i style="width:'+used.toFixed(0)+'%"></i></div>'+
+        '<p class="tiny dim2" style="margin:9px 0 0">You have <b style="color:var(--ink)">'+travel.toFixed(1)+' semitones</b> of movement available on demand, and in normal conversation you use about <b style="color:var(--ink)">'+Math.round(used)+'%</b> of it. '+
+        'Closing that gap is what the training is, and it is measured against <em>your</em> floor — not against anyone else\'s.</p>'+
+        '</div>';
+      })() : '')+
+
       (n?'<div class="card" style="margin-top:12px">'+
       '<p class="lbl" style="margin-bottom:4px">How you naturally speak</p>'+
       row('Pace', Math.round(n.wpm)+' wpm', 'persuasive band is 148–174')+
-      row('Pitch range', n.span.toFixed(1)+' st', n.span<4?'under 4 reads as monotone':n.span<6?'a little narrow':'engaged')+
+      row('Pitch range', n.span.toFixed(1)+' st',
+        (p.flat? 'your flat is '+p.flat.span.toFixed(1)+' — so you add '+(n.span-p.flat.span).toFixed(1)+' without thinking'
+               : n.span<4?'under 4 reads as monotone':'engaged'))+
       row('Terminal', (n.term>0?'+':'')+n.term.toFixed(1)+' st', n.term<-2?'you fall — good':n.term>1?'you tend to rise on statements':'you tend to end flat')+
       row('Dynamics', n.dyn.toFixed(1)+' dB', n.dyn<4?'flat — most people are':'good variation')+
       row('Silence', Math.round(n.pauseFrac)+'%', '15–25% is healthy')+
@@ -4702,9 +4807,12 @@ function mCalibrate(arg){
        'Your natural terminal is '+(n.term>1?'rising':'flat')+' at '+(n.term>0?'+':'')+n.term.toFixed(1)+' semitones. '+
        'That is the highest-leverage single habit to change, and the Terminal Trainer exists for exactly it. Start there.</div>':'')+
 
-      (n && n.span<4.5 ?'<div class="note acc" style="margin-top:10px"><span class="l">Your first target</span>'+
-       'Your natural pitch range is '+n.span.toFixed(1)+' semitones. Under about four reads as monotone to a listener. '+
-       'The Monotone Killer widens it — and note the trick: widen the range while keeping your average pitch <em>low</em>. Most people raise their whole voice instead, which sounds anxious rather than engaged.</div>':'')+
+      (p.flat && p.expressive && n && (n.span-p.flat.span) < (p.expressive.span-p.flat.span)*0.4
+       ?'<div class="note acc" style="margin-top:10px"><span class="l">Your first target</span>'+
+        'You demonstrated '+(p.expressive.span-p.flat.span).toFixed(1)+' semitones of range on demand, but you only use '+
+        Math.round((n.span-p.flat.span)/Math.max(0.5,p.expressive.span-p.flat.span)*100)+'% of it when you actually talk. '+
+        'That is not a capacity problem — the range is already there. It is a deployment habit, and the Monotone Killer is the drill that closes it. '+
+        'The trick worth knowing: widen the movement while keeping your average pitch <em>low</em>. Most people raise their whole voice instead, which reads as anxious rather than engaged.</div>':'')+
 
       '<div class="row" style="margin-top:20px">'+
       '<button class="btn big" onclick="Drill.close();Drill.launch(\'warmup\')">Now do the warmup →</button>'+
@@ -6240,10 +6348,33 @@ function profileCard(){
     (p.noiseDb!=null?cell('Room floor', Math.round(p.noiseDb)+'<span class="u">dB</span>', p.noiseDb<-54?'quiet':'some noise'):'')+
     cell('Tracker', Math.round(b.lo)+'–'+Math.round(b.hi), 'Hz search window')+
   '</div>'+
+  (p.flat && p.expressive && n ? (function(){
+    var travel=Math.max(0.1, p.expressive.span-p.flat.span);
+    var used=Math.max(0,Math.min(100,(n.span-p.flat.span)/travel*100));
+    return '<div class="card" style="margin-top:12px">'+
+    '<p class="lbl" style="margin-bottom:4px">Your three-point range</p>'+
+    '<p class="tiny dim2" style="margin-bottom:12px">The same sentence read three ways. Your flat is the zero point every score is measured from — because “flat” is a different number for every voice, and measuring against a population average instead of your own floor is how people get told they are monotone before they have even tried.</p>'+
+    '<div class="readout" style="margin-bottom:12px">'+
+    cell('Flat', p.flat.span.toFixed(1)+'<span class="u">st</span>','your floor')+
+    cell('Natural', n.span.toFixed(1)+'<span class="u">st</span>','your habit')+
+    cell('Full colour', p.expressive.span.toFixed(1)+'<span class="u">st</span>','your ceiling')+
+    cell('Travel', travel.toFixed(1)+'<span class="u">st</span>','available on demand')+
+    '</div>'+
+    '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">'+
+    '<span class="dim2">Range you use in normal conversation</span>'+
+    '<span class="mono" style="color:'+(used>=60?'var(--ok)':used>=35?'var(--acc)':'var(--no)')+'">'+Math.round(used)+'%</span></div>'+
+    '<div class="meter '+(used>=60?'ok':used>=35?'':'no')+'" style="height:9px"><i style="width:'+used.toFixed(0)+'%"></i></div>'+
+    '<p class="tiny dim" style="margin:9px 0 0">'+(used>=60?'You deploy most of the range you have. Work on precision rather than amount.':
+      used>=35?'Solid, with room to push. The capacity is demonstrably there — this is about deployment.':
+      'You have substantially more range available than you use day to day. That is the easiest gain in the app, and it is a habit rather than a limit.')+'</p>'+
+    '</div>';
+  })() : '')+
+
   (n?'<div class="card" style="margin-top:12px"><p class="lbl" style="margin-bottom:10px">How you naturally speak — the line every rep is compared against</p>'+
    '<div class="readout">'+
    cell('Pace', Math.round(n.wpm)+'<span class="u">wpm</span>','persuasive 148–174')+
-   cell('Range', n.span.toFixed(1)+'<span class="u">st</span>', n.span<4?'reads monotone':n.span<6?'narrow':'engaged')+
+   cell('Range', n.span.toFixed(1)+'<span class="u">st</span>',
+     p.flat? '+'+(n.span-p.flat.span).toFixed(1)+' over your flat' : (n.span<4?'reads monotone':'engaged'))+
    cell('Terminal', (n.term>0?'+':'')+n.term.toFixed(1)+'<span class="u">st</span>', n.term<-2?'you fall':n.term>1?'you rise':'you end flat')+
    cell('Dynamics', n.dyn.toFixed(1)+'<span class="u">dB</span>', n.dyn<4?'flat':'good')+
    cell('Silence', Math.round(n.pauseFrac)+'<span class="u">%</span>','15–25% healthy')+

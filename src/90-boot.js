@@ -9,6 +9,14 @@
 var pref=S.raw().prefs.theme;
 document.documentElement.setAttribute('data-theme', pref==='light'?'light':'dark');
 
+// bring the cloud up in the background — the app never waits on it
+if(window.Cloud && Cloud.configured()){
+  Cloud.on(function(){ UI.paintHud(); UI.render(); });
+  Cloud.boot().then(function(ok){
+    if(ok && Cloud.signedIn()) UI.toast('Signed in — progress syncing');
+  });
+}
+
 // route from hash
 var h=location.hash.replace('#','');
 if(h) UI.go(h); else UI.render();

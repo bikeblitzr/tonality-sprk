@@ -64,7 +64,16 @@ var NAV=[
 {id:'power',     ic:'♆', n:'Power & Psych'},
 {g:'You'},
 {id:'path',      ic:'⟶', n:'90-Day Path'},
-{id:'progress',  ic:'▲', n:'Progress'}
+{id:'progress',  ic:'▲', n:'Progress'},
+{id:'account',   ic:'◍', n:'Account'}
+];
+var NAV_ADMIN=[
+{g:'Admin'},
+{id:'admin',     ic:'▚', n:'Team'},
+{g:'Your own training'},
+{id:'home',      ic:'◉', n:'Today'},
+{id:'progress',  ic:'▲', n:'Progress'},
+{id:'account',   ic:'◍', n:'Account'}
 ];
 
 var view='home', viewArg=null;
@@ -78,19 +87,33 @@ function go(v, arg){
 }
 
 function paintNav(){
-  $('#nav').innerHTML = NAV.map(function(n){
+  $('#nav').innerHTML = (isAdminMode()?NAV_ADMIN:NAV).map(function(n){
     if(n.g) return '<div class="navgrp">'+esc(n.g)+'</div>';
     var tag = n.tag ? '<span class="tag">'+n.tag()+'</span>' : '';
     return '<button class="nb'+(view===n.id?' on':'')+'" data-go="'+n.id+'"><span class="ic">'+n.ic+'</span>'+esc(n.n)+tag+'</button>';
   }).join('');
 }
 
+var adminMode=false;
+function isAdminMode(){ return adminMode && window.Cloud && Cloud.isAdmin(); }
+
 function paintHud(){
   var p=S.levelProgress(), s=S.raw();
+  var admin = window.Cloud && Cloud.isAdmin && Cloud.isAdmin();
   $('#hud').innerHTML =
+    (admin?'<div class="seg" style="width:100%;margin:0 0 10px;display:flex" id="roleSeg">'+
+      '<button data-r="student" style="flex:1"'+(!adminMode?' class="on"':'')+'>Student</button>'+
+      '<button data-r="admin" style="flex:1"'+(adminMode?' class="on"':'')+'>Admin</button></div>':'')+
     '<div class="hudtop"><span class="hudlvl">Level <i>'+p.lvl+'</i></span><span class="hudrank">'+esc(p.rank)+'</span></div>'+
     '<div class="xpbar"><i style="width:'+p.pct.toFixed(1)+'%"></i></div>'+
     '<div class="hudsub"><span>'+p.cur+' / '+p.need+' xp</span><span><b>'+s.streak+'</b>d streak · <b>'+s.reps+'</b> reps</span></div>';
+  var seg=$('#roleSeg');
+  if(seg) seg.onclick=function(e){
+    var b=e.target.closest('[data-r]'); if(!b) return;
+    e.stopPropagation();
+    adminMode = b.dataset.r==='admin';
+    go(adminMode?'admin':'home');
+  };
 }
 
 function paintMic(){
@@ -291,9 +314,33 @@ document.addEventListener('click', function(e){
 });
 
 $('#themeBtn').onclick=toggleTheme;
+$('#fbBtn').onclick=feedbackModal;
 $('#railToggle').onclick=function(){ $('#rail').classList.toggle('open'); $('#scrim').classList.toggle('on'); };
 $('#scrim').onclick=function(){ $('#rail').classList.remove('open'); $('#scrim').classList.remove('on'); };
 $('#hud').onclick=function(){ go('progress'); };
+/* ---------- feedback ---------- */
+function feedbackModal(){
+  modal('<h2>Tell me what is wrong with it</h2>'+
+    '<p class="dim2" style="font-size:14.5px;margin-top:6px">Anything — a score that felt unfair, a drill that made no sense, '+
+    'a tone that is missing, wording that is confusing. This is a beta and the misses are the useful part.</p>'+
+    '<textarea id="fbMsg" placeholder="What happened, and what did you expect instead?" style="min-height:120px;margin-top:14px"></textarea>'+
+    '<p class="tiny dim" style="margin-top:8px">Sent with the page you are on and your level. No audio, ever.'+
+    (Cloud.signedIn()?'':' <b style="color:var(--acc)">You are not signed in — this will only be stored in this browser.</b>')+'</p>'+
+    '<div class="row" style="margin-top:14px"><button class="btn" id="fbSend">Send</button>'+
+    '<button class="btn gh" onclick="UI.closeModal()">Cancel</button></div>');
+  $('#fbMsg').focus();
+  $('#fbSend').onclick=function(){
+    var m=$('#fbMsg').value.trim();
+    if(!m){ closeModal(); return; }
+    var s=S.raw();
+    var ctx={level:S.levelProgress().lvl, reps:s.reps, calibrated:!!(s.profile&&s.profile.done),
+             personalTargets:!!s.prefs.personalTargets, ua:navigator.userAgent.slice(0,120)};
+    if(Cloud.signedIn()) Cloud.logFeedback({page:view, message:m, context:ctx});
+    else { s.localFeedback=(s.localFeedback||[]).concat([{page:view,message:m,at:Date.now()}]).slice(-40); S.save(); }
+    closeModal(); toast('Thank you — logged');
+  };
+}
+
 $('#helpBtn').onclick=function(){
   modal('<h2>Keyboard</h2><div class="prose" style="margin-top:12px">'+
   '<table><tr><td><kbd>space</kbd></td><td>Start / stop recording in a drill</td></tr>'+
@@ -386,7 +433,8 @@ return {
   toast:toast, modal:modal, closeModal:closeModal, setTheme:setTheme, toggleTheme:toggleTheme,
   go:go, render:render, registerView:registerView, paintHud:paintHud, paintMic:paintMic,
   needMic:needMic, LiveScope:LiveScope, drawContour:drawContour, drawWave:drawWave,
-  ring:ring, readouts:readouts, faultList:faultList,
+  ring:ring, readouts:readouts, faultList:faultList, feedbackModal:feedbackModal,
+  isAdminMode:isAdminMode, setAdminMode:function(v){adminMode=!!v;},
   current:function(){return view;}, arg:function(){return viewArg;}
 };
 })();

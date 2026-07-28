@@ -40,6 +40,8 @@ var S = (function(){
              sibilant:null,   // {sHz, shHz, ratio, flag}
              natural:null,    // {wpm, span, term, dyn, pauseFrac, floorDrop, baseHz}
              history:[]},     // past calibrations, for drift
+    scenarios:[], advisorMisses:[],
+    secondsActive:0,
     firstSeen:null
   };
   var s = Store.get() || JSON.parse(JSON.stringify(def));
@@ -122,6 +124,15 @@ var S = (function(){
     var xp = score==null ? 6 : Math.max(5, Math.round(score/6) + (score>=90?12:score>=75?6:0));
     s.xp+=xp;
     checkAch(); save();
+    // mirror to the cloud if signed in — derived numbers only, never audio
+    if(window.Cloud && Cloud.signedIn && Cloud.signedIn()){
+      Cloud.logRep({tone:toneId, drill:(extra&&extra.drill)||null, score:score,
+        wpm:extra&&extra.wpm, span:extra&&extra.span, term:extra&&extra.term,
+        dyn:extra&&extra.dyn, pauseFrac:extra&&extra.pauseFrac,
+        floorDrop:extra&&extra.floorDrop, fryPct:extra&&extra.fryPct,
+        baseHz:extra&&extra.baseHz, personalised:s.prefs.personalTargets});
+      Cloud.pushAll();
+    }
     if(window.UI && UI.paintHud) UI.paintHud();
     return xp;
   }
@@ -245,6 +256,39 @@ var S = (function(){
     return Math.abs(st) > 3.5 ? {st:+st.toFixed(1), measured:Math.round(med), profile:Math.round(p.modalHz)} : null;
   }
 
+  /* merge a remote snapshot in, keeping whichever side is further along
+     on each counter so signing in on a second device never loses work */
+  function mergeRemote(r){
+    if(!r || typeof r!=='object') return;
+    ['xp','reps','scored','sessions','streak','bestStreak','day','secondsActive'].forEach(function(k){
+      if(typeof r[k]==='number') s[k]=Math.max(s[k]||0, r[k]);
+    });
+    ['mastery','twisters','codexRead','powerRead','ach','dayDone'].forEach(function(k){
+      if(r[k] && typeof r[k]==='object'){
+        s[k]=s[k]||{};
+        Object.keys(r[k]).forEach(function(id){
+          var a=s[k][id], b=r[k][id];
+          if(a==null){ s[k][id]=b; return; }
+          if(typeof a==='number' && typeof b==='number'){ s[k][id]=Math.max(a,b); return; }
+          if(typeof a==='object' && typeof b==='object'){
+            s[k][id]=Object.assign({}, b, a);
+            if(b.m!=null && a.m!=null) s[k][id].m=Math.max(a.m,b.m);
+            if(b.n!=null && a.n!=null) s[k][id].n=Math.max(a.n,b.n);
+            if(b.best!=null && a.best!=null) s[k][id].best=Math.max(a.best,b.best);
+            if(b.last!=null && a.last!=null) s[k][id].last=Math.max(a.last,b.last);
+          }
+        });
+      }
+    });
+    if(Array.isArray(r.hist) && r.hist.length > (s.hist||[]).length) s.hist=r.hist.slice(-900);
+    if(Array.isArray(r.scenarios) && r.scenarios.length > (s.scenarios||[]).length) s.scenarios=r.scenarios;
+    if(r.profile && r.profile.done && !(s.profile && s.profile.done)){
+      s.profile=r.profile; if(window.Audio && Audio.setProfile) Audio.setProfile(r.profile);
+    }
+    if(r.prefs) s.prefs=Object.assign({}, r.prefs, s.prefs);
+    save();
+  }
+
   function reset(){ Store.clear(); location.reload(); }
   function exportJson(){ return JSON.stringify(s,null,2); }
   function importJson(txt){
@@ -256,6 +300,7 @@ var S = (function(){
     raw:function(){return s;}, save:save, level:level, levelProgress:levelProgress,
     addXp:addXp, recordRep:recordRep, masteryOf:masteryOf, rawMastery:rawMastery,
     saveProfile:saveProfile, profile:profile, clearProfile:clearProfile, profileDrift:profileDrift,
+    mergeRemote:mergeRemote,
     weakQueue:weakQueue, tierUnlocked:tierUnlocked, tierNeed:tierNeed,
     grant:grant, checkAch:checkAch, noteMetric:noteMetric, stats:stats, touchDay:touchDay,
     reset:reset, exportJson:exportJson, importJson:importJson, today:today

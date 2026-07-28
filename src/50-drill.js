@@ -190,6 +190,37 @@ function playback(){
 /* ---------------- utility ---------------- */
 /* "vs your baseline" strip — always shown when a profile exists, alongside
    the standard score rather than instead of it. Two honest numbers. */
+/* "Was that score fair?" — the highest-value telemetry in the app.
+   The audio engine was validated against synthetic signals, not real
+   voices, so this is how a systematic misread on a particular kind of
+   voice actually surfaces instead of quietly making someone give up. */
+function fairnessStrip(tone, score, a){
+  var id='fair'+Math.random().toString(36).slice(2,8);
+  setTimeout(function(){
+    var w=document.getElementById(id); if(!w) return;
+    w.onclick=function(e){
+      var b=e.target.closest('[data-fair]'); if(!b) return;
+      var v=b.dataset.fair;
+      if(window.Cloud && Cloud.signedIn()){
+        Cloud.logFairness({verdict:v, tone:tone&&tone.id, score:score,
+          acoustics:{wpm:a&&Math.round(a.dur*10)/10, span:a&&+a.span.toFixed(1), term:a&&+a.term.toFixed(1),
+                     dyn:a&&+a.dyn.toFixed(1), floorDrop:a&&+a.floorDrop.toFixed(1),
+                     baseHz:a&&Math.round(a.baseline), fryPct:a&&Math.round(a.fryPct)}});
+      } else {
+        var s=S.raw(); s.localFairness=(s.localFairness||[]).concat([{v:v,tone:tone&&tone.id,score:score,at:Date.now()}]).slice(-60); S.save();
+      }
+      w.innerHTML='<p class="tiny dim" style="margin:0">Logged — thank you. That is what makes the scoring better.</p>';
+    };
+  },0);
+  return '<div id="'+id+'" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line);'+
+    'display:flex;gap:9px;align-items:center;flex-wrap:wrap">'+
+    '<span class="tiny dim">Was that score fair?</span>'+
+    '<button class="btn gh sm" data-fair="about_right" style="padding:3px 10px;font-size:11.5px">Fair</button>'+
+    '<button class="btn gh sm" data-fair="too_low" style="padding:3px 10px;font-size:11.5px">Too harsh</button>'+
+    '<button class="btn gh sm" data-fair="too_high" style="padding:3px 10px;font-size:11.5px">Too generous</button>'+
+    '</div>';
+}
+
 function baselineStrip(r){
   if(!r || !r.vsBase || !r.vsBase.length) return '';
   var hr=r.vsBase.headroom;
@@ -599,7 +630,7 @@ function mCustom(){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
-      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({tone:t, score:r.score, isAlt:t.id!==primary.id});
       $('#result').innerHTML='<hr style="margin:20px 0 18px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -689,7 +720,7 @@ function mToneLab(arg){
       var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
       if(S.raw().prefs.hardMode) r.score=Math.max(0, Math.round(r.score*0.88));
-      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       S.noteMetric('span', a.span); S.noteMetric('term', a.term);
       D.results.push({tone:t, score:r.score});
       $('#result').innerHTML=
@@ -698,7 +729,7 @@ function mToneLab(arg){
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score, t)+'</p>'+
         '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · mastery on '+esc(t.name)+' now '+S.masteryOf(t.id)+'%'+
         (r.personalised?' · <span style="color:var(--cy)">personal bands</span>':'')+'</p></div></div>'+
-        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins);
+        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins)+fairnessStrip(t, r.score, a);
       $('#recNote').textContent='Press R to redo, → for next.';
       if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
     }, {maxSec:22});
@@ -1199,7 +1230,7 @@ function mScript(arg){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, t, UI.words(sc.lines[D.i][1]), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({score:r.score, tone:t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -1238,7 +1269,7 @@ function mRoulette(){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.l), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(it.t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      S.recordRep(it.t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({score:r.score, tone:it.t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+
@@ -1478,7 +1509,7 @@ function mCold(){
     wireRecorder(function(a){
       var r=Audio.scoreAgainstTone(a, it.t, UI.words(it.txt), S.raw().prefs.personalTargets);
       if(!r) return;
-      S.recordRep(it.t.id, r.score, {wpm:r.wpm,span:a.span,term:a.term,floorDrop:a.floorDrop,baseHz:a.baseline});
+      S.recordRep(it.t.id, r.score, {wpm:r.wpm,span:a.span,term:a.term,floorDrop:a.floorDrop,baseHz:a.baseline, drill:D&&D.name?D.name:null});
       D.results.push({score:r.score, tone:it.t});
       $('#result').innerHTML='<hr style="margin:18px 0 14px">'+
         '<div class="scorewrap">'+UI.ring(r.score)+

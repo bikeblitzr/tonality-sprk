@@ -2,16 +2,20 @@
 
 An endless training system for voice, tone, emphasis, articulation and the psychology behind them. It listens to you through the microphone and grades what you actually produce against measurable acoustic targets.
 
-Single self-contained HTML file. No build step required to run it, no dependencies, no backend, no analytics. Everything is processed locally in the browser using the Web Audio API — **no audio is ever uploaded, stored on a server, or sent anywhere.** Progress lives in `localStorage` and can be exported as JSON.
+Single self-contained HTML file. No build step required to run it, no dependencies, no analytics. All audio is processed locally in the browser using the Web Audio API — **no audio is ever uploaded, stored on a server, or sent anywhere.** Progress lives in `localStorage` and can be exported as JSON.
+
+An optional Supabase backend adds accounts, cross-device sync and a team dashboard. It is genuinely optional: with no account, and with the backend unreachable, every drill still runs and everything still saves locally.
 
 ---
 
 ## What's in it
 
-**18 drill modes**
+**20 drill modes**
 
 | Mode | What it measures |
 |---|---|
+| Calibration | Seven steps, nothing scored — noise floor, register, usable range, sibilant separation, and your **flat** baseline |
+| Custom Prompt | You give it the call stage and what you are about to say; it names the tone, the nucleus word and the contour, then drills it |
 | The Warmup | 14-step mechanical routine — straw phonation, lip trills, DDK racks, breath benchmark |
 | Tone Lab | Full acoustic grade against a tone's target profile: pace, range, terminal, dynamics, silence |
 | Terminal Trainer | Pitch move over the final syllables, in semitones. Fall / rise / level on command |
@@ -43,6 +47,34 @@ Single self-contained HTML file. No build step required to run it, no dependenci
 
 ---
 
+## Calibration and the flat baseline
+
+Everyone has a different *flat* — the way they sound with no deliberate emphasis at all. A speaker whose unemphasised voice already moves 6 semitones is doing nothing special when a drill measures 6; a speaker whose flat is 1.5 has just travelled four times as far for the same number.
+
+Calibration measures three separate reads — flat, natural, expressive — and stores the distance between them. After that, every result shows two things:
+
+- **The score**, always against the fixed research-backed bands, so numbers stay comparable between people
+- **vs your flat**, with a headroom bar showing how far you actually travelled out of the range you demonstrated you have
+
+There is also a **Personal Mode** toggle (off by default, clearly labelled non-comparable) which switches the scoring itself onto bands anchored to your own flat. Terminal inflection is never personalised — a falling terminal is a physical event, not a relative one.
+
+Calibration also narrows the pitch tracker from the full human range down to yours, which is what makes octave errors rare rather than occasional.
+
+---
+
+## Accounts, sync and the team dashboard
+
+Optional, and off until someone signs up. Sign-up takes a username, name, email, phone and a 6-digit PIN — no email verification, no 2FA.
+
+- **Sync** — progress and voice profile upload on a debounce and merge on pull. The merge takes the maximum per counter and per mastery field, so training on a second device can never wipe the first.
+- **Telemetry** — one row per rep: tone, drill, score, and the acoustic numbers behind it. Plus fairness flags (when a target looks unreachable for that speaker's measured range) and advisor misses (when someone rejects the tone the Custom Prompt picked). No audio, no transcripts — derived numbers only.
+- **Feedback** — a button in the rail writes straight to the account, and falls back to local storage when offline.
+- **Admin view** — a student/admin toggle in the header. Admin shows who is active, reps and time per person, the tones the team is weakest at, fairness flags and advisor misses. Row-level security means a non-admin account cannot read another person's rows even if they try.
+
+Schema, policies and the signup trigger are in [`supabase/schema.sql`](supabase/schema.sql).
+
+---
+
 ## The measurement layer
 
 Scoring is against figures from the phonetics and speech-science literature rather than invented ones:
@@ -69,6 +101,14 @@ npm run dev     # rebuild + serve locally
 npm run build   # concatenate src/ into index.html
 ```
 
+To point it at your own backend, run `supabase/schema.sql` in the Supabase SQL editor and set `CLOUD_CONFIG` at the top of `src/25-cloud.js` to your project URL and **publishable** key. The secret key is never used and must never be put in this file — every query runs client-side under row-level security. Leave `CLOUD_CONFIG` blank and the app runs fully local.
+
+Promote yourself to admin once, after signing up:
+
+```sql
+update public.profiles set role = 'admin' where email = 'you@example.com';
+```
+
 ## Editing it
 
 `index.html` is generated. Edit the parts in `src/` and run `node build.mjs` — files are concatenated in filename order.
@@ -80,15 +120,21 @@ src/
   10-data-tones.js      72 tones with acoustic targets
   11-data-twisters.js   230 twisters
   12-data-lines.js      emphasis tables, focus rules, pause drills, contours, line pools, scripts
+  13-data-advisor.js    Custom Prompt rules engine — stages, modifiers, triggers, nucleus finder
   14-data-codex.js      theory chapters
   15-data-power.js      psychology principles, influence reference, frame rack
   16-data-curriculum.js levels, ranks, achievements, 90-day path
-  20-audio.js           mic capture, pitch tracking, VAD, scoring
-  30-state.js           persistence, XP, mastery decay, spaced repetition
-  40-ui-core.js         router, shell, canvases, modal, toasts
-  50-drill.js           the stage — all 18 drill modes
+  20-audio.js           mic capture, pitch tracking, VAD, calibration, scoring
+  25-cloud.js           Supabase client — auth, sync, telemetry queue, time tracking
+  30-state.js           persistence, XP, mastery decay, spaced repetition, remote merge
+  40-ui-core.js         router, shell, canvases, modal, toasts, student/admin toggle
+  50-drill.js           the stage — all 20 drill modes
   60-views.js           all pages
+  62-views-cloud.js     account, admin dashboard, per-person drill-down
   90-boot.js            boot + first-run
+
+supabase/
+  schema.sql            tables, RLS policies, signup trigger, team views
 ```
 
 ---

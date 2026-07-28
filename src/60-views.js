@@ -509,10 +509,33 @@ function profileCard(){
     (p.noiseDb!=null?cell('Room floor', Math.round(p.noiseDb)+'<span class="u">dB</span>', p.noiseDb<-54?'quiet':'some noise'):'')+
     cell('Tracker', Math.round(b.lo)+'–'+Math.round(b.hi), 'Hz search window')+
   '</div>'+
+  (p.flat && p.expressive && n ? (function(){
+    var travel=Math.max(0.1, p.expressive.span-p.flat.span);
+    var used=Math.max(0,Math.min(100,(n.span-p.flat.span)/travel*100));
+    return '<div class="card" style="margin-top:12px">'+
+    '<p class="lbl" style="margin-bottom:4px">Your three-point range</p>'+
+    '<p class="tiny dim2" style="margin-bottom:12px">The same sentence read three ways. Your flat is the zero point every score is measured from — because “flat” is a different number for every voice, and measuring against a population average instead of your own floor is how people get told they are monotone before they have even tried.</p>'+
+    '<div class="readout" style="margin-bottom:12px">'+
+    cell('Flat', p.flat.span.toFixed(1)+'<span class="u">st</span>','your floor')+
+    cell('Natural', n.span.toFixed(1)+'<span class="u">st</span>','your habit')+
+    cell('Full colour', p.expressive.span.toFixed(1)+'<span class="u">st</span>','your ceiling')+
+    cell('Travel', travel.toFixed(1)+'<span class="u">st</span>','available on demand')+
+    '</div>'+
+    '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">'+
+    '<span class="dim2">Range you use in normal conversation</span>'+
+    '<span class="mono" style="color:'+(used>=60?'var(--ok)':used>=35?'var(--acc)':'var(--no)')+'">'+Math.round(used)+'%</span></div>'+
+    '<div class="meter '+(used>=60?'ok':used>=35?'':'no')+'" style="height:9px"><i style="width:'+used.toFixed(0)+'%"></i></div>'+
+    '<p class="tiny dim" style="margin:9px 0 0">'+(used>=60?'You deploy most of the range you have. Work on precision rather than amount.':
+      used>=35?'Solid, with room to push. The capacity is demonstrably there — this is about deployment.':
+      'You have substantially more range available than you use day to day. That is the easiest gain in the app, and it is a habit rather than a limit.')+'</p>'+
+    '</div>';
+  })() : '')+
+
   (n?'<div class="card" style="margin-top:12px"><p class="lbl" style="margin-bottom:10px">How you naturally speak — the line every rep is compared against</p>'+
    '<div class="readout">'+
    cell('Pace', Math.round(n.wpm)+'<span class="u">wpm</span>','persuasive 148–174')+
-   cell('Range', n.span.toFixed(1)+'<span class="u">st</span>', n.span<4?'reads monotone':n.span<6?'narrow':'engaged')+
+   cell('Range', n.span.toFixed(1)+'<span class="u">st</span>',
+     p.flat? '+'+(n.span-p.flat.span).toFixed(1)+' over your flat' : (n.span<4?'reads monotone':'engaged'))+
    cell('Terminal', (n.term>0?'+':'')+n.term.toFixed(1)+'<span class="u">st</span>', n.term<-2?'you fall':n.term>1?'you rise':'you end flat')+
    cell('Dynamics', n.dyn.toFixed(1)+'<span class="u">dB</span>', n.dyn<4?'flat':'good')+
    cell('Silence', Math.round(n.pauseFrac)+'<span class="u">%</span>','15–25% healthy')+

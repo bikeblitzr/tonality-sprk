@@ -541,12 +541,38 @@ function bandScore(v, band, tolerance){
 function personalBands(tone){
   var P=PROFILE;
   if(!P || !P.natural) return null;
-  var N=P.natural, T=tone.target;
+  var T=tone.target, F=P.flat, E=P.expressive, N=P.natural;
+
+  // With a three-point profile we can do this properly: anchor the band on
+  // where THIS speaker's floor actually is, and scale it by the range they
+  // demonstrably have on demand. A person whose flat already carries 6 st
+  // and one whose flat carries 2 st should not be handed the same target.
+  if(F && E && E.span > F.span + 0.5){
+    var travel = E.span - F.span;
+    var stdMid = (T.span[0]+T.span[1])/2, stdHalf = (T.span[1]-T.span[0])/2;
+    // where the standard band sits as a fraction of a typical 8-st travel,
+    // re-expressed against this speaker's own travel
+    var frac = Math.max(0.35, Math.min(1.0, stdMid/8));
+    var centre = F.span + travel*frac;
+    var half = Math.max(1.2, stdHalf * (travel/8));
+    var spanBand = [ +(centre-half).toFixed(1), +(centre+half).toFixed(1) ];
+    // never let the personal floor fall at or below their flat — that would
+    // score them as engaged while they are doing nothing
+    spanBand[0] = Math.max(spanBand[0], +(F.span + travel*0.28).toFixed(1));
+    spanBand[1] = Math.max(spanBand[1], spanBand[0]+1.5);
+    return {
+      wpm:  shift(T.wpm,  N.wpm,  1,    70, 240),
+      span: [Math.max(2.5, spanBand[0]), Math.min(20, spanBand[1])],
+      term: T.term,
+      dyn:  shift(T.dyn,  (F.dyn!=null? F.dyn + Math.max(0,(E.dyn-F.dyn))*0.55 : N.dyn), 1, 2, 22),
+      pause:shift(T.pause, N.pauseFrac, 1.05, 5, 55)
+    };
+  }
+
+  // fallback: older profiles that only captured a single natural read
   function shift(band, natural, stretch, floor, ceil){
     if(natural==null) return band;
     var mid=(band[0]+band[1])/2;
-    // move the standard band a third of the way toward this speaker's
-    // own habit, then push it up by the stretch factor
     var lo = band[0] + (natural-mid)*0.33;
     var hi = band[1] + (natural-mid)*0.33;
     lo*=stretch; hi*=stretch;
@@ -561,21 +587,35 @@ function personalBands(tone){
   };
 }
 
-/* how far this rep sits above the speaker's own calibration baseline */
+/* How far this rep sits above the speaker's own FLOOR.
+   Flat is the honest zero point — "you added 3.2 semitones over your own
+   flat" means something, where "your span was 5.1" does not, because 5.1
+   is engaged for one person and disengaged for another.               */
 function vsBaseline(a, W){
   var P=PROFILE;
   if(!P || !P.natural) return null;
-  var N=P.natural, out=[];
-  if(N.span!=null)  out.push({k:'Range',    d:a.span - N.span,        u:'st', better:'up'});
-  if(N.dyn!=null)   out.push({k:'Dynamics', d:a.dyn  - N.dyn,         u:'dB', better:'up'});
-  if(N.term!=null)  out.push({k:'Terminal', d:N.term - a.term,        u:'st', better:'up'});
-  if(N.pauseFrac!=null) out.push({k:'Silence', d:a.pauseFrac-N.pauseFrac, u:'%', better:'up'});
-  if(N.floorDrop!=null) out.push({k:'Held to end', d:N.floorDrop-a.floorDrop, u:'dB', better:'up'});
-  return out.map(function(x){
-    x.d = +x.d.toFixed(1);
-    x.good = x.d > 0.4;
-    return x;
-  });
+  var base = P.flat || P.natural;
+  var ref  = P.flat ? 'flat' : 'baseline';
+  var out=[];
+  if(base.span!=null)  out.push({k:'Range',    d:a.span - base.span,   u:'st', ref:ref});
+  if(base.dyn!=null)   out.push({k:'Dynamics', d:a.dyn  - base.dyn,    u:'dB', ref:ref});
+  if(base.term!=null)  out.push({k:'Terminal', d:base.term - a.term,   u:'st', ref:ref});
+  if(base.pauseFrac!=null) out.push({k:'Silence', d:a.pauseFrac-base.pauseFrac, u:'%', ref:ref});
+  if(base.floorDrop!=null) out.push({k:'Held to end', d:base.floorDrop-a.floorDrop, u:'dB', ref:ref});
+  var rows = out.map(function(x){ x.d=+x.d.toFixed(1); x.good = x.d > 0.4; return x; });
+
+  // headroom: how much of their demonstrated range this rep actually used
+  if(P.flat && P.expressive){
+    var travel = Math.max(0.5, P.expressive.span - P.flat.span);
+    var used = (a.span - P.flat.span) / travel * 100;
+    rows.headroom = {
+      pct: Math.round(Math.max(0, Math.min(140, used))),
+      travel: +travel.toFixed(1),
+      flat: +P.flat.span.toFixed(1),
+      ceil: +P.expressive.span.toFixed(1)
+    };
+  }
+  return rows;
 }
 
 function scoreAgainstTone(a, tone, wordCount, usePersonal){

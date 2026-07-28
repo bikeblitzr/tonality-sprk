@@ -31,8 +31,15 @@ var S = (function(){
     ach:{}, day:1, dayDone:{},
     streak:0, lastDay:null, bestStreak:0,
     hist:[],           // {ts, tone, score, wpm, span, term}
-    prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true},
+    prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true,
+           personalTargets:false},
     counters:{warmups:0, perfect:0, floorStreak:0, twCleared:0, gauntlets:0, gauntletBest:0, scripts:0},
+    /* voice profile from calibration — see Audio.setProfile */
+    profile:{done:false, at:null, noiseDb:null, modalHz:null, mpt:null, steadiness:null,
+             lowHz:null, highHz:null, semitones:null,
+             sibilant:null,   // {sHz, shHz, ratio, flag}
+             natural:null,    // {wpm, span, term, dyn, pauseFrac, floorDrop, baseHz}
+             history:[]},     // past calibrations, for drift
     firstSeen:null
   };
   var s = Store.get() || JSON.parse(JSON.stringify(def));
@@ -40,6 +47,8 @@ var S = (function(){
   (function fill(t,d){ for(var k in d){ if(!(k in t)) t[k]=JSON.parse(JSON.stringify(d[k]));
     else if(d[k] && typeof d[k]==='object' && !Array.isArray(d[k])) fill(t[k],d[k]); } })(s,def);
   if(!s.firstSeen) s.firstSeen=Date.now();
+  // hand the saved voice profile to the audio engine before anything records
+  if(s.profile && s.profile.done) Audio.setProfile(s.profile);
 
   function save(){ Store.set(s); }
   function today(){ var d=new Date(); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate(); }
@@ -101,7 +110,8 @@ var S = (function(){
       s.hist.push({ts:Date.now(), tone:toneId, score:score,
         wpm: extra&&extra.wpm?Math.round(extra.wpm):null,
         span: extra&&extra.span!=null?+extra.span.toFixed(1):null,
-        term: extra&&extra.term!=null?+extra.term.toFixed(1):null});
+        term: extra&&extra.term!=null?+extra.term.toFixed(1):null,
+        baseHz: extra&&extra.baseHz?Math.round(extra.baseHz):null});
       if(s.hist.length>900) s.hist=s.hist.slice(-900);
       if(score>=95){ s.counters.perfect++; }
       if(extra && extra.floorDrop!=null){
@@ -203,6 +213,38 @@ var S = (function(){
     };
   }
 
+  /* ---------- voice profile ---------- */
+  function saveProfile(p){
+    var old=s.profile;
+    if(old && old.done){
+      s.profile.history = (old.history||[]).concat([{
+        at:old.at, modalHz:old.modalHz, lowHz:old.lowHz, highHz:old.highHz,
+        mpt:old.mpt, natural:old.natural, sibilant:old.sibilant
+      }]).slice(-8);
+    }
+    var hist=s.profile.history||[];
+    s.profile=Object.assign({}, s.profile, p, {done:true, at:Date.now(), history:hist});
+    Audio.setProfile(s.profile);
+    save();
+    return s.profile;
+  }
+  function profile(){ return s.profile && s.profile.done ? s.profile : null; }
+  function clearProfile(){
+    s.profile={done:false, at:null, noiseDb:null, modalHz:null, mpt:null, steadiness:null,
+               lowHz:null, highHz:null, semitones:null, sibilant:null, natural:null,
+               history:s.profile.history||[]};
+    Audio.setProfile(null); save();
+  }
+  /* has their voice drifted far enough from the profile to be worth re-running? */
+  function profileDrift(){
+    var p=profile(); if(!p || !p.modalHz) return null;
+    var recent=s.hist.slice(-15).filter(function(h){ return h.baseHz; });
+    if(recent.length<8) return null;
+    var med=recent.map(function(h){return h.baseHz;}).sort(function(a,b){return a-b;})[Math.floor(recent.length/2)];
+    var st=12*Math.log2(med/p.modalHz);
+    return Math.abs(st) > 3.5 ? {st:+st.toFixed(1), measured:Math.round(med), profile:Math.round(p.modalHz)} : null;
+  }
+
   function reset(){ Store.clear(); location.reload(); }
   function exportJson(){ return JSON.stringify(s,null,2); }
   function importJson(txt){
@@ -213,6 +255,7 @@ var S = (function(){
   return {
     raw:function(){return s;}, save:save, level:level, levelProgress:levelProgress,
     addXp:addXp, recordRep:recordRep, masteryOf:masteryOf, rawMastery:rawMastery,
+    saveProfile:saveProfile, profile:profile, clearProfile:clearProfile, profileDrift:profileDrift,
     weakQueue:weakQueue, tierUnlocked:tierUnlocked, tierNeed:tierNeed,
     grant:grant, checkAch:checkAch, noteMetric:noteMetric, stats:stats, touchDay:touchDay,
     reset:reset, exportJson:exportJson, importJson:importJson, today:today

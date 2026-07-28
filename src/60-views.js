@@ -29,6 +29,13 @@ UI.registerView('home', function(){
     'Nothing here scores until the mic is on. Everything is processed locally in your browser — no audio is uploaded or stored anywhere. '+
     '<button class="btn sm" style="margin-left:8px" data-act="mic">Turn on the mic</button></div>';
 
+  var calWarn = S.profile() ? '' :
+    '<div class="note cy" style="margin-bottom:20px"><span class="l">Calibrate first</span>'+
+    '<b>Two minutes, five steps, nothing scored.</b> It measures your room\'s noise floor, your register, your usable pitch range and your natural speaking habits — '+
+    'then narrows the pitch tracker from the full human range down to yours. Every score you get afterwards is more accurate for it, and you get a baseline to measure movement against. '+
+    'Whatever your voice does — accent, register, a lisp, a soft voice — this is where the app learns it.'+
+    '<div style="margin-top:11px"><button class="btn sm" data-drill="calibrate">Calibrate my voice</button></div></div>';
+
   var todayMods = day.mods.map(function(id){
     return MODULES.filter(function(m){return m.id===id;})[0];
   }).filter(Boolean);
@@ -40,7 +47,7 @@ UI.registerView('home', function(){
     'Six minutes of mechanical warmup, then a single neutral sentence into the Tone Lab so the app can see where you actually are. Do not try to fix anything on day one.':
     esc(day.note))+'</p></div>'+
 
-  micWarn+
+  micWarn+ calWarn+
 
   '<div class="grid g4" style="margin-bottom:26px">'+
   '<div class="stat acc"><p class="k">Level</p><div class="v">'+p.lvl+'</div><p class="s">'+esc(p.rank)+'</p></div>'+
@@ -472,6 +479,53 @@ UI.registerView('path:act', function(a,arg){
   }
 });
 
+/* ---------- voice profile card ---------- */
+function profileCard(){
+  var p=S.profile();
+  if(!p){
+    return '<div class="sect" style="margin-top:0"><div class="card" style="border-color:var(--acc-line);background:var(--acc-wash)">'+
+      '<div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">'+
+      '<div style="flex:1;min-width:260px"><h3 style="font-size:17px;margin-bottom:5px">Your voice is not calibrated yet</h3>'+
+      '<p class="tiny dim2" style="margin:0">Two minutes, five steps, nothing scored. It measures your room noise floor, your register and breath support, your usable pitch range, your articulation and your natural speaking habits — '+
+      'and it narrows the pitch tracker from the full human range down to yours, which is the biggest single accuracy gain available.</p></div>'+
+      '<button class="btn" data-drill="calibrate">Calibrate now</button></div></div></div>';
+  }
+  var n=p.natural, sb=p.sibilant, b=Audio.bounds();
+  var drift=S.profileDrift();
+  function cell(k,v,s){ return '<div class="ro"><p class="k">'+esc(k)+'</p><div class="v" style="font-size:18px">'+v+'</div>'+
+    (s?'<p class="t">'+esc(s)+'</p>':'')+'</div>'; }
+  return '<div class="sect" style="margin-top:0"><div class="shead"><h2>Your voice profile</h2>'+
+  '<span class="n">calibrated '+new Date(p.at).toLocaleDateString()+'</span></div>'+
+  '<p class="sdesc">What the engine knows about your instrument and your room. Everything here is a measurement, not a grade.</p>'+
+  (drift?'<div class="note acc"><span class="l">Worth re-calibrating</span>'+
+    'Your recent reps are averaging <b>'+drift.measured+' Hz</b> against a profile of <b>'+drift.profile+' Hz</b> — that is '+
+    Math.abs(drift.st)+' semitones of drift. Different mic, different room, a cold, or just a different time of day. '+
+    'Re-running calibration takes two minutes and will sharpen every score.</div>':'')+
+  '<div class="readout">'+
+    (p.modalHz?cell('Modal pitch', Math.round(p.modalHz)+'<span class="u">Hz</span>','your resting note'):'')+
+    (p.lowHz?cell('Usable range', Math.round(p.lowHz)+'–'+Math.round(p.highHz),'Hz · '+(p.semitones||0).toFixed(1)+' st'):'')+
+    (p.mpt?cell('Breath', p.mpt.toFixed(1)+'<span class="u">s</span>', p.mpt>=18?'strong':p.mpt>=12?'normal':'short'):'')+
+    (sb?cell('Sibilant sep.', sb.ratio.toFixed(2)+'<span class="u">×</span>', 'typical 1.6–2.2'):'')+
+    (p.noiseDb!=null?cell('Room floor', Math.round(p.noiseDb)+'<span class="u">dB</span>', p.noiseDb<-54?'quiet':'some noise'):'')+
+    cell('Tracker', Math.round(b.lo)+'–'+Math.round(b.hi), 'Hz search window')+
+  '</div>'+
+  (n?'<div class="card" style="margin-top:12px"><p class="lbl" style="margin-bottom:10px">How you naturally speak — the line every rep is compared against</p>'+
+   '<div class="readout">'+
+   cell('Pace', Math.round(n.wpm)+'<span class="u">wpm</span>','persuasive 148–174')+
+   cell('Range', n.span.toFixed(1)+'<span class="u">st</span>', n.span<4?'reads monotone':n.span<6?'narrow':'engaged')+
+   cell('Terminal', (n.term>0?'+':'')+n.term.toFixed(1)+'<span class="u">st</span>', n.term<-2?'you fall':n.term>1?'you rise':'you end flat')+
+   cell('Dynamics', n.dyn.toFixed(1)+'<span class="u">dB</span>', n.dyn<4?'flat':'good')+
+   cell('Silence', Math.round(n.pauseFrac)+'<span class="u">%</span>','15–25% healthy')+
+   '</div></div>':'')+
+  (S.raw().prefs.personalTargets?'<div class="note cy" style="margin-top:12px"><span class="l">Personal Mode is on</span>'+
+   'Your scores are being measured against bands stretched from this profile rather than the fixed standard. '+
+   'That makes them more encouraging and <b>not comparable to anyone else\'s</b>. Turn it off in settings if you are tracking a team.</div>':'')+
+  '<div class="row" style="margin-top:12px">'+
+  '<button class="btn sec sm" data-drill="calibrate" data-arg="redo">Re-run calibration</button>'+
+  (p.history&&p.history.length?'<span class="tiny dim">'+p.history.length+' earlier calibration'+(p.history.length>1?'s':'')+' kept</span>':'')+
+  '</div></div>';
+}
+
 /* ============================================================ PROGRESS */
 UI.registerView('progress', function(){
   var s=S.raw(), st=S.stats(), p=S.levelProgress();
@@ -491,7 +545,9 @@ UI.registerView('progress', function(){
   '<div class="stat '+(st.avg100>=80?'ok':'')+'"><p class="k">Avg score</p><div class="v">'+(st.avg100!=null?Math.round(st.avg100):'—')+'</div><p class="s">last 100 reps</p></div>'+
   '</div>'+
 
-  (st.avgWpm!=null? '<div class="sect" style="margin-top:0"><div class="shead"><h2>Your averages</h2><span class="n">last 100 scored reps</span></div>'+
+  profileCard()+
+
+  (st.avgWpm!=null? '<div class="sect"><div class="shead"><h2>Your averages</h2><span class="n">last 100 scored reps</span></div>'+
   '<div class="readout">'+
   '<div class="ro '+(st.avgWpm>=130&&st.avgWpm<=185?'good':'warn')+'"><p class="k">Pace</p><div class="v">'+Math.round(st.avgWpm)+'<span class="u">wpm</span></div><p class="t">148–174 persuasive</p></div>'+
   '<div class="ro '+(st.avgSpan>=6?'good':st.avgSpan>=4?'warn':'bad')+'"><p class="k">Range</p><div class="v">'+(st.avgSpan!=null?st.avgSpan.toFixed(1):'—')+'<span class="u">st</span></div><p class="t">6–10 engaged</p></div>'+

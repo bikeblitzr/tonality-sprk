@@ -315,6 +315,17 @@ $('#settingsBtn').onclick=function(){
      '<span><b>Auto-advance</b><br><span class="dim tiny">Move to the next item automatically after a scored rep.</span></span></label>'+
    '<label class="ck" style="margin-bottom:16px"><input type="checkbox" id="setNums"'+(s.prefs.showNums?' checked':'')+'>'+
      '<span><b>Show live numbers</b><br><span class="dim tiny">Live pitch and level readouts during recording. Turn off if it distracts you.</span></span></label>'+
+   '<hr><p class="lbl" style="margin-bottom:10px">Your voice</p>'+
+   (S.profile()
+     ? '<p class="tiny dim2" style="margin-bottom:10px">Calibrated — modal pitch <b class="mono">'+Math.round(S.profile().modalHz||0)+' Hz</b>, '+
+       'range <b class="mono">'+Math.round(S.profile().lowHz||0)+'–'+Math.round(S.profile().highHz||0)+' Hz</b>.</p>'+
+       '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setPersonal"'+(s.prefs.personalTargets?' checked':'')+'>'+
+       '<span><b>Personal Mode</b><br><span class="dim tiny">Scores against bands stretched from <em>your</em> calibration instead of the fixed research-backed ones. '+
+       'More encouraging early on — but scores stop being comparable between people, so leave it off if you are tracking a team. '+
+       'The “vs your baseline” readout appears either way.</span></span></label>'
+     : '<p class="tiny dim2" style="margin-bottom:10px">Not calibrated yet. Two minutes, and every score afterwards is measured more accurately.</p>')+
+   '<div class="row" style="margin-bottom:16px"><button class="btn sec sm" id="calBtn">'+(S.profile()?'Re-run calibration':'Calibrate my voice')+'</button>'+
+   (S.profile()?'<button class="btn gh sm" id="calClear">Clear profile</button>':'')+'</div>'+
    '<hr><p class="lbl" style="margin-bottom:8px">Your data</p>'+
    '<div class="row"><button class="btn sec sm" id="expBtn">Export progress</button>'+
    '<button class="btn sec sm" id="impBtn">Import</button>'+
@@ -324,6 +335,17 @@ $('#settingsBtn').onclick=function(){
   $('#setHard').onchange=function(){ s.prefs.hardMode=this.checked; S.save(); };
   $('#setAuto').onchange=function(){ s.prefs.autoNext=this.checked; S.save(); };
   $('#setNums').onchange=function(){ s.prefs.showNums=this.checked; S.save(); };
+  if($('#setPersonal')) $('#setPersonal').onchange=function(){
+    s.prefs.personalTargets=this.checked; S.save();
+    toast(this.checked ? 'Personal Mode <b>on</b> — scores are no longer comparable between people'
+                       : 'Personal Mode <b>off</b> — back to the fixed standard');
+  };
+  $('#calBtn').onclick=function(){ closeModal(); needMic().then(function(ok){ if(ok) Drill.launch('calibrate','redo'); }); };
+  if($('#calClear')) $('#calClear').onclick=function(){
+    if(confirm('Clear your voice profile? The pitch tracker goes back to searching the full range for everyone, and the "vs your baseline" readouts disappear.')){
+      S.clearProfile(); closeModal(); render();
+    }
+  };
   $('#expBtn').onclick=function(){
     var b=new Blob([S.exportJson()],{type:'application/json'});
     var u=URL.createObjectURL(b), a=document.createElement('a');

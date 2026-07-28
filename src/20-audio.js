@@ -17,9 +17,28 @@ var listeners=[];
 /* rolling capture */
 var frames=[];         // {t, f0, rms, db, voiced}
 var chunks=[];         // Float32 audio for playback
+var specFrames=[];     // {t, db, mags:Float32Array}  — only while grabSpectra
+var grabSpectra=false;
 var t0=0;
 var lastErr=null;
 var micState='idle';   // idle | live | denied | error
+
+/* ---------- speaker profile ----------
+   Set from calibration. Narrows the pitch-tracker search window (the
+   single biggest source of octave errors), gives the VAD a real room
+   noise floor, and supplies personal stretch bands.                */
+var PROFILE=null;
+function setProfile(p){ PROFILE = (p && p.done) ? p : null; }
+function getProfile(){ return PROFILE; }
+
+/* search bounds — wide by default, narrow once we know the speaker */
+function bounds(){
+  if(!PROFILE || !PROFILE.lowHz || !PROFILE.highHz) return {lo:60, hi:900};
+  return {
+    lo: Math.max(50,  Math.min(160, PROFILE.lowHz  * 0.72)),
+    hi: Math.max(240, Math.min(900, PROFILE.highHz * 1.55))
+  };
+}
 
 /* ---------- helpers ---------- */
 function hzToSt(hz, ref){ return 12*Math.log2(hz/ref); }
@@ -39,8 +58,9 @@ function detectPitch(buf, sr){
   rms=Math.sqrt(rms/n);
   if(rms<0.006) return -1;
 
-  var maxLag=Math.floor(sr/60);      // 60 Hz floor
-  var minLag=Math.floor(sr/900);     // 900 Hz ceiling
+  var B=bounds();
+  var maxLag=Math.floor(sr/B.lo);
+  var minLag=Math.floor(sr/B.hi);
   if(maxLag>n-1) maxLag=n-1;
 
   var nsdf=new Float32Array(maxLag+1);
@@ -76,7 +96,7 @@ function detectPitch(buf, sr){
   for(j=0;j<peaks.length;j++){
     if(peaks[j].val>=thresh){
       var f=sr/peaks[j].lag;
-      if(f>=60 && f<=900) return f;
+      if(f>=B.lo && f<=B.hi) return f;
       return -1;
     }
   }
@@ -88,10 +108,16 @@ function smoothF0(arr){
   var out=arr.slice();
   var vals=arr.filter(function(v){return v>0;});
   if(vals.length<6) return out;
-  var med=median(vals);
+  // anchor on the speaker's known modal F0 when we have one — a short
+  // utterance's own median is a shaky reference, the profile's is not
+  var med = median(vals);
+  if(PROFILE && PROFILE.modalHz){
+    var drift = Math.abs(12*Math.log2(med/PROFILE.modalHz));
+    if(drift < 7) med = med*0.4 + PROFILE.modalHz*0.6;
+  }
   for(var i=0;i<out.length;i++){
     if(out[i]<=0) continue;
-    // fix octave jumps against the running median
+    // fix octave jumps against the reference
     if(out[i] > med*1.7) out[i]/=2;
     else if(out[i] < med*0.58) out[i]*=2;
   }
@@ -124,6 +150,7 @@ function start(){
     source=ctx.createMediaStreamSource(stream);
     analyser=ctx.createAnalyser();
     analyser.fftSize=BUF; analyser.smoothingTimeConstant=0;
+    analyser.minDecibels=-95; analyser.maxDecibels=-12;
     gain=ctx.createGain(); gain.gain.value=0;
     proc=ctx.createScriptProcessor(BUF,1,1);
     source.connect(analyser);
@@ -179,12 +206,30 @@ function onAudio(ev){
     frames.push({t:t, f0:f0, rms:rms, db:db, voiced:f0>0 && db>-52});
     var c=new Float32Array(n); c.set(buf); chunks.push(c);
     if(frames.length>24000){ frames.shift(); chunks.shift(); }
+
+    // full-resolution spectrum, only during calibration steps that need it
+    if(grabSpectra && analyser && specFrames.length<900){
+      var fb=new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(fb);
+      var lin=new Float32Array(fb.length);
+      var mn=analyser.minDecibels, mx=analyser.maxDecibels;
+      for(i=0;i<fb.length;i++){
+        // byte 0..255 maps linearly across [minDecibels, maxDecibels] — undo it
+        var dbv = mn + (fb[i]/255)*(mx-mn);
+        lin[i] = fb[i]>0 ? Math.pow(10, dbv/20) : 0;
+      }
+      specFrames.push({t:t, db:db, mags:lin});
+    }
   }
 }
 
 /* ---------- capture control ---------- */
-function beginCapture(){ frames=[]; chunks=[]; t0=performance.now(); capturing=true; }
-function endCapture(){ capturing=false; return analyse(); }
+function beginCapture(opts){
+  frames=[]; chunks=[]; specFrames=[];
+  grabSpectra = !!(opts && opts.spectra);
+  t0=performance.now(); capturing=true;
+}
+function endCapture(){ capturing=false; grabSpectra=false; return analyse(); }
 function isCapturing(){ return capturing; }
 function live(){ return {f0:liveF0, db:liveDb, rms:liveRms, spec:specBins, elapsed: capturing?(performance.now()-t0)/1000:0}; }
 function liveFrames(){ return frames; }
@@ -300,6 +345,176 @@ function analyse(){
   };
 }
 
+/* ============================================================
+   CALIBRATION ANALYSES
+   ============================================================ */
+
+/* --- step 1: room noise floor --- */
+function analyseNoise(){
+  var raw=frames.slice();
+  if(raw.length<8) return null;
+  var dbs=raw.map(function(f){return f.db;});
+  var floorDb = pct(dbs,0.5);
+  var peakDb  = pct(dbs,0.97);
+  var verdict, ok;
+  if(floorDb < -62){ verdict='Very quiet. Ideal conditions.'; ok=true; }
+  else if(floorDb < -54){ verdict='Quiet enough. Nothing to worry about.'; ok=true; }
+  else if(floorDb < -46){ verdict='Some background noise. Workable, but the pause measurements will be a little softer than they could be.'; ok=true; }
+  else { verdict='Noisy. A fan, air conditioning, traffic or an open room. Pause and pace scores will be unreliable until it is quieter — move rooms or use a headset mic if you can.'; ok=false; }
+  return {floorDb:floorDb, peakDb:peakDb, verdict:verdict, ok:ok, spread:peakDb-floorDb};
+}
+
+/* --- step 2: sustained vowel — register, breath support, stability --- */
+function analyseSustain(){
+  var raw=frames.slice();
+  if(raw.length<10) return null;
+  var f0s=smoothF0(raw.map(function(f){return f.f0>0?f.f0:-1;}));
+  for(var i=0;i<raw.length;i++) raw[i].f0s=f0s[i];
+  var voiced=raw.filter(function(f){ return f.f0s>0 && f.db>-52; });
+  if(voiced.length<8) return {empty:true};
+
+  // longest continuous voiced run = maximum phonation time
+  var best=0, run=0, lastT=-1, frameDur = raw.length>1 ? (raw[raw.length-1].t-raw[0].t)/(raw.length-1) : 0.043;
+  for(i=0;i<raw.length;i++){
+    if(raw[i].f0s>0 && raw[i].db>-52){ run+=frameDur; if(run>best) best=run; }
+    else run=0;
+  }
+  var hz=voiced.map(function(f){return f.f0s;});
+  var modal=median(hz);
+  // stability: semitone standard deviation across the sustain
+  var sts=hz.map(function(h){ return hzToSt(h, modal); });
+  var m=mean(sts);
+  var sd=Math.sqrt(mean(sts.map(function(s){ return (s-m)*(s-m); })));
+  return {modalHz:modal, mpt:best, steadiness:sd, frames:voiced.length};
+}
+
+/* --- step 3: pitch glide — usable range --- */
+function analyseGlide(){
+  var raw=frames.slice();
+  if(raw.length<10) return null;
+  // glide search must be wide — this is what SETS the bounds, so ignore any profile
+  var saved=PROFILE; PROFILE=null;
+  var f0s=smoothF0(raw.map(function(f){return f.f0>0?f.f0:-1;}));
+  PROFILE=saved;
+  for(var i=0;i<raw.length;i++) raw[i].f0s=f0s[i];
+  var voiced=raw.filter(function(f){ return f.f0s>0 && f.db>-50; });
+  if(voiced.length<10) return {empty:true};
+  var hz=voiced.map(function(f){return f.f0s;});
+  // 5th/95th percentile, not min/max — endpoints are where tracking is worst
+  var lo=pct(hz,0.05), hi=pct(hz,0.95);
+  var mid=median(hz);
+  return {lowHz:lo, highHz:hi, midHz:mid, semitones: hzToSt(hi, lo), frames:voiced.length};
+}
+
+/* --- spectral centre of gravity over a band ---
+   A naive magnitude centroid is badly biased: every fricative has broad
+   skirts, and whichever side of the measurement band has more room to
+   spread drags the answer toward the band's middle. That compresses the
+   /s/-to-/ʃ/ ratio, which is exactly the number we care about — so a
+   plain centroid would produce false "compressed separation" readings on
+   perfectly normal speakers.
+   Two corrections: gate to bins near the peak (kills the skirts), and
+   weight by power rather than amplitude (sharpens what's left).      */
+function cog(mags, sr, loHz, hiHz, gateFrac){
+  var nyq=sr/2, n=mags.length, i;
+  var i0=Math.max(1, Math.floor(loHz/nyq*n)), i1=Math.min(n-1, Math.ceil(hiHz/nyq*n));
+  if(i1<=i0) return 0;
+  var peak=0;
+  for(i=i0;i<=i1;i++) if(mags[i]>peak) peak=mags[i];
+  if(peak<=0) return 0;
+  var gate=peak*(gateFrac==null?0.45:gateFrac);
+  var num=0, den=0;
+  for(i=i0;i<=i1;i++){
+    var m=mags[i];
+    if(m<gate) continue;
+    var p=m*m;
+    num += (i/n*nyq)*p; den += p;
+  }
+  return den>0 ? num/den : 0;
+}
+
+/* --- step 4: sibilants.  "sssss … shhhhh" in one capture ---
+   Measures the spectral centre of gravity of each fricative and, more
+   importantly, the SEPARATION between them. Absolute COG scales with
+   vocal-tract length; the ratio does not, so the ratio is the honest
+   number and the one we report against.                              */
+function analyseSibilants(){
+  if(specFrames.length<10) return null;
+  var raw=frames.slice();
+  if(raw.length<10) return null;
+
+  var dbs=raw.map(function(f){return f.db;});
+  var gate=Math.max(pct(dbs,0.92)-22, pct(dbs,0.1)+8, -58);
+
+  // segment into voiced/noisy regions on the same gate the VAD uses
+  var segs=[], cur=null;
+  for(var i=0;i<raw.length;i++){
+    if(raw[i].db>gate){ if(!cur) cur={s:raw[i].t,e:raw[i].t}; else cur.e=raw[i].t; }
+    else if(cur){ segs.push(cur); cur=null; }
+  }
+  if(cur) segs.push(cur);
+  var merged=[];
+  segs.forEach(function(s){
+    if(merged.length && s.s-merged[merged.length-1].e < 0.15) merged[merged.length-1].e=s.e;
+    else merged.push({s:s.s,e:s.e});
+  });
+  segs = merged.filter(function(s){ return s.e-s.s > 0.25; });
+  if(segs.length<2) return {tooFew:true, segs:segs.length};
+
+  // take the two longest — trims throat clears and stray noise
+  segs.sort(function(a,b){ return (b.e-b.s)-(a.e-a.s); });
+  var two=segs.slice(0,2).sort(function(a,b){ return a.s-b.s; });
+
+  function segCog(seg){
+    var fs=specFrames.filter(function(f){
+      // trim 20% off each end — the transitions in and out aren't the fricative
+      var pad=(seg.e-seg.s)*0.2;
+      return f.t>=seg.s+pad && f.t<=seg.e-pad;
+    });
+    if(fs.length<3) return null;
+    var n=fs[0].mags.length, acc=new Float32Array(n);
+    fs.forEach(function(f){ for(var k=0;k<n;k++) acc[k]+=f.mags[k]; });
+    for(var k=0;k<n;k++) acc[k]/=fs.length;
+    return { cog: cog(acc, SR, 1500, 11000), frames:fs.length, dur:seg.e-seg.s };
+  }
+
+  var A=segCog(two[0]), B=segCog(two[1]);
+  if(!A || !B) return {tooFew:true, segs:segs.length};
+
+  // whichever is higher is /s/, the other /ʃ/ — order-independent, so it
+  // still works if someone says them the other way round
+  var s  = A.cog >= B.cog ? A : B;
+  var sh = A.cog >= B.cog ? B : A;
+  var ratio = sh.cog>0 ? s.cog/sh.cog : 0;
+
+  var verdict, flag;
+  if(ratio >= 1.55){
+    verdict='Clear separation between your /s/ and /ʃ/. Nothing to work on here.'; flag='ok';
+  } else if(ratio >= 1.3){
+    verdict='Slightly compressed separation. Common, usually just a soft /s/ — the sibilant rack in Articulation sharpens it.'; flag='soft';
+  } else {
+    verdict='Your /s/ and /ʃ/ are sitting very close together. That can mean a soft or fronted /s/, or simply that the two sounds ran into each other in the recording. It is worth re-running this step to check, and if it holds, the sibilant rack is the drill that targets it.'; flag='close';
+  }
+  return {
+    sHz:s.cog, shHz:sh.cog, ratio:ratio, verdict:verdict, flag:flag,
+    sDur:s.dur, shDur:sh.dur
+  };
+}
+
+/* --- step 5: natural speech baseline --- */
+function analyseNatural(a, wordCount){
+  if(!a || a.empty) return null;
+  return {
+    wpm: wpm(a, wordCount),
+    span: a.span,
+    term: a.term,
+    dyn: a.dyn,
+    pauseFrac: a.pauseFrac,
+    floorDrop: a.floorDrop,
+    baseHz: a.baseline
+  };
+}
+
 /* ---------- rate ---------- */
 function wpm(a, wordCount){
   if(!a || !a.speechTime || !wordCount) return 0;
@@ -318,9 +533,57 @@ function bandScore(v, band, tolerance){
   return clamp(1 - d/tol, 0, 1);
 }
 
-function scoreAgainstTone(a, tone, wordCount){
+/* ---------- personal stretch bands ----------
+   Derived from calibration. Deliberately set ABOVE the person's natural
+   habit — the point is to stretch them past where they already sit, not
+   to lower the bar to meet them. Terminal is never personalised: a fall
+   is a fall, that's physics rather than physiology.                    */
+function personalBands(tone){
+  var P=PROFILE;
+  if(!P || !P.natural) return null;
+  var N=P.natural, T=tone.target;
+  function shift(band, natural, stretch, floor, ceil){
+    if(natural==null) return band;
+    var mid=(band[0]+band[1])/2;
+    // move the standard band a third of the way toward this speaker's
+    // own habit, then push it up by the stretch factor
+    var lo = band[0] + (natural-mid)*0.33;
+    var hi = band[1] + (natural-mid)*0.33;
+    lo*=stretch; hi*=stretch;
+    return [Math.max(floor, +lo.toFixed(1)), Math.min(ceil, +hi.toFixed(1))];
+  }
+  return {
+    wpm:  shift(T.wpm,  N.wpm,  1,    70,  240),
+    span: shift(T.span, N.span, 1.12, 3.5, 18),
+    term: T.term,
+    dyn:  shift(T.dyn,  N.dyn,  1.08, 2,   20),
+    pause:shift(T.pause,N.pauseFrac, 1.05, 5, 55)
+  };
+}
+
+/* how far this rep sits above the speaker's own calibration baseline */
+function vsBaseline(a, W){
+  var P=PROFILE;
+  if(!P || !P.natural) return null;
+  var N=P.natural, out=[];
+  if(N.span!=null)  out.push({k:'Range',    d:a.span - N.span,        u:'st', better:'up'});
+  if(N.dyn!=null)   out.push({k:'Dynamics', d:a.dyn  - N.dyn,         u:'dB', better:'up'});
+  if(N.term!=null)  out.push({k:'Terminal', d:N.term - a.term,        u:'st', better:'up'});
+  if(N.pauseFrac!=null) out.push({k:'Silence', d:a.pauseFrac-N.pauseFrac, u:'%', better:'up'});
+  if(N.floorDrop!=null) out.push({k:'Held to end', d:N.floorDrop-a.floorDrop, u:'dB', better:'up'});
+  return out.map(function(x){
+    x.d = +x.d.toFixed(1);
+    x.good = x.d > 0.4;
+    return x;
+  });
+}
+
+function scoreAgainstTone(a, tone, wordCount, usePersonal){
   if(!a || a.empty) return null;
-  var T=tone.target, parts=[], faults=[], wins=[];
+  var std=tone.target;
+  var pers = personalBands(tone);
+  var T = (usePersonal && pers) ? pers : std;
+  var parts=[], faults=[], wins=[];
 
   var W=wpm(a, wordCount);
   var sW=bandScore(W, T.wpm, 42);
@@ -366,7 +629,12 @@ function scoreAgainstTone(a, tone, wordCount){
   if(a.floorDrop>6) score=Math.max(0,score-7);
   if(a.span<3) score=Math.max(0,score-8);
 
-  return {score:score, parts:parts, faults:faults, wins:wins, wpm:W};
+  return {
+    score:score, parts:parts, faults:faults, wins:wins, wpm:W,
+    personalised: !!(usePersonal && pers),
+    hasPersonal: !!pers,
+    vsBase: vsBaseline(a, W)
+  };
 }
 
 /* ---------- targeted scorers ---------- */
@@ -519,6 +787,10 @@ return {
   start:start, stop:stop, ready:ready, state:state, error:error, on:on,
   beginCapture:beginCapture, endCapture:endCapture, isCapturing:isCapturing,
   live:live, liveFrames:liveFrames, analyse:analyse,
+  setProfile:setProfile, getProfile:getProfile, bounds:bounds,
+  analyseNoise:analyseNoise, analyseSustain:analyseSustain, analyseGlide:analyseGlide,
+  analyseSibilants:analyseSibilants, analyseNatural:analyseNatural,
+  personalBands:personalBands, vsBaseline:vsBaseline, cog:cog,
   wpm:wpm, scoreAgainstTone:scoreAgainstTone, scoreTerminal:scoreTerminal,
   scorePace:scorePace, scoreRange:scoreRange, scoreFloor:scoreFloor, scorePauses:scorePauses,
   contourTrace:contourTrace, scoreContour:scoreContour,

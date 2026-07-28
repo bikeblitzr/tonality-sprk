@@ -53,6 +53,7 @@ function toggleTheme(){ setTheme(document.documentElement.getAttribute('data-the
 var NAV=[
 {g:'Train'},
 {id:'home',      ic:'◉', n:'Today'},
+{id:'coach',     ic:'✦', n:'Custom Prompt'},
 {id:'modules',   ic:'▦', n:'All Drills'},
 {id:'tones',     ic:'◐', n:'Tone Library', tag:function(){return TONES.length;}},
 {id:'twisters',  ic:'⟡', n:'Articulation', tag:function(){return TWISTERS.length;}},

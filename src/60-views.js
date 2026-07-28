@@ -479,6 +479,208 @@ UI.registerView('path:act', function(a,arg){
   }
 });
 
+/* ============================================================ CUSTOM PROMPT TONALITY */
+UI.registerView('coach', function(){
+  var saved=S.raw().scenarios||[];
+  return '<div class="page wide">'+
+  '<div class="phead"><p class="kick">Tell it where you are · it tells you how to say it</p>'+
+  '<h1>Custom Prompt Tonality</h1>'+
+  '<p class="lede">Pick the moment you are in, paste the line you are about to say, flag what the room is doing — and it returns the tone to use, why that one, where the emphasis goes, where the silence goes, and which tone would be a mistake here. Then you drill <em>your</em> line, not a sample one.</p></div>'+
+
+  '<div class="split" style="grid-template-columns:400px 1fr;align-items:start;gap:24px">'+
+
+  /* ---- input column ---- */
+  '<div style="position:sticky;top:0">'+
+  '<div class="card">'+
+  '<p class="lbl" style="margin-bottom:9px">1 · Where are you in the call?</p>'+
+  '<select id="cpStage" style="margin-bottom:5px">'+STAGES.map(function(s){
+    return '<option value="'+s.id+'"'+(CP.stage===s.id?' selected':'')+'>'+esc(s.n)+'</option>'; }).join('')+'</select>'+
+  '<p class="tiny dim" id="cpStageHint" style="margin:0 0 18px">'+esc((STAGES.filter(function(s){return s.id===CP.stage;})[0]||STAGES[0]).hint)+'</p>'+
+
+  '<p class="lbl" style="margin-bottom:9px">2 · What are you about to say?</p>'+
+  '<textarea id="cpLine" placeholder="Paste the actual line. A question, a claim, a close — whatever you are about to put in their ear." style="min-height:92px;margin-bottom:6px">'+esc(CP.line)+'</textarea>'+
+  '<p class="tiny dim" style="margin:0 0 18px">Or leave it blank and it will recommend from the stage and situation alone.</p>'+
+
+  '<p class="lbl" style="margin-bottom:9px">3 · What is the room doing?</p>'+
+  '<div class="row" style="gap:6px;margin-bottom:6px">'+MODS.map(function(m){
+    var on=CP.mods.indexOf(m.id)>=0;
+    return '<button class="chip'+(on?' acc':'')+'" data-act="mod" data-arg="'+m.id+'" style="cursor:pointer;font-size:11.5px;padding:5px 10px">'+
+      m.ic+' '+esc(m.n)+'</button>'; }).join('')+'</div>'+
+  '<p class="tiny dim" style="margin:0 0 18px">Optional, and they stack. These are what change the answer most.</p>'+
+
+  '<button class="btn blk big" data-act="run">Tell me the tone</button>'+
+  (CP.res?'<button class="btn gh blk sm" data-act="clear" style="margin-top:8px">Clear</button>':'')+
+  '</div>'+
+
+  (saved.length?'<div class="card" style="margin-top:12px">'+
+   '<p class="lbl" style="margin-bottom:10px">Your saved scenarios <span class="dim">('+saved.length+')</span></p>'+
+   saved.slice().reverse().slice(0,8).map(function(sc,i){
+     var idx=saved.length-1-i, t=TONE_BY_ID[sc.tone];
+     return '<div style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)">'+
+       '<div style="flex:1;min-width:0"><p class="tiny" style="margin:0 0 3px;color:var(--ink)">“'+esc(sc.line.slice(0,58))+(sc.line.length>58?'…':'')+'”</p>'+
+       '<span class="chip tiny" style="color:'+(t?FAMILIES[t.fam].c:'var(--muted)')+'">'+esc(t?t.name:sc.tone)+'</span></div>'+
+       '<button class="btn gh sm" data-act="load" data-arg="'+idx+'" style="padding:3px 8px;font-size:11px">open</button>'+
+       '<button class="btn gh sm" data-act="del" data-arg="'+idx+'" style="padding:3px 7px;font-size:11px">✕</button></div>';
+   }).join('')+'</div>':'')+
+  '</div>'+
+
+  /* ---- results column ---- */
+  '<div id="cpOut">'+(CP.res?renderAdvice(CP.res):emptyAdvice())+'</div>'+
+  '</div></div>';
+});
+
+function emptyAdvice(){
+  return '<div class="card" style="padding:30px 26px">'+
+  '<h3 style="font-size:18px;margin-bottom:8px">How this decides</h3>'+
+  '<div class="prose" style="font-size:14.5px">'+
+  '<p>It is a rules engine, not a language model — everything runs in your browser, instantly and offline, and every recommendation traces back to a named rule that gets shown to you. Three signals, combined:</p>'+
+  '<p><b>The stage</b> sets a prior. Discovery leans curious and neutral; consequence leans low and slow; the ask leans flat and unremarkable. That is the starting distribution before anything you type.</p>'+
+  '<p><b>Your line</b> is matched against about thirty phrase patterns and analysed structurally — question or statement, wh- or yes/no, imperative, hedged, contrastive, how long. A duration question pulls hard toward concern. "Who is responsible" pulls toward accountability. "If nothing changes" pulls toward the consequence drop.</p>'+
+  '<p><b>The modifiers</b> move it most, and they can veto. Flag that they have gone defensive and confrontation gets locked out entirely, no matter what the stage said.</p>'+
+  '<h4>What it is bad at</h4>'+
+  '<p>Sarcasm, industry jargon it has never seen, and anything where the right tone depends on history it has no access to. It reads the shape of your sentence, not your relationship. When it is wrong, the second and third suggestions are usually where the right answer is — and there is a button to tell me when it misses.</p>'+
+  '</div></div>';
+}
+
+function renderAdvice(r){
+  var top=r.ranked[0], t=top.tone, notes=deliveryNotes(r);
+  var fam=FAMILIES[t.fam];
+  var conf = r.confidence>=75?'high':r.confidence>=55?'moderate':'low';
+
+  return '<div class="card" style="border-color:'+fam.c+';border-width:1px;padding:0;overflow:hidden">'+
+  '<div style="height:3px;background:'+fam.c+'"></div>'+
+  '<div style="padding:20px 22px">'+
+  '<div class="row" style="margin-bottom:10px">'+
+  '<span class="chip tiny" style="background:transparent;border-color:'+fam.c+';color:'+fam.c+'">'+esc(fam.name)+'</span>'+
+  '<span class="spacer"></span>'+
+  '<span class="tiny dim mono">'+r.confidence+'% · '+conf+' confidence</span></div>'+
+  '<h2 style="font-size:26px;letter-spacing:-.02em;margin-bottom:6px">'+esc(t.name)+'</h2>'+
+  '<p class="dim2" style="font-size:15px;margin-bottom:14px">'+esc(t.conveys)+'</p>'+
+  '<div class="note acc" style="margin-bottom:0"><span class="l">Do this before you speak</span>'+esc(t.cue)+'</div>'+
+  '<div class="row" style="margin-top:16px">'+
+  '<button class="btn" data-act="drill">▶ Drill this line</button>'+
+  '<button class="btn sec" data-act="save">Save scenario</button>'+
+  '<button class="btn gh sm" data-go="tones" data-arg="'+t.id+'">Full recipe</button>'+
+  '<span class="spacer"></span>'+
+  '<button class="btn gh sm" data-act="wrong" title="Log this as a miss">Wrong call?</button>'+
+  '</div></div></div>'+
+
+  (r.line?'<div class="card" style="margin-top:12px">'+
+   '<p class="lbl" style="margin-bottom:12px">Say it like this</p>'+
+   '<p class="utter xs" style="margin-bottom:16px">'+markLine(r)+'</p>'+
+   '<div class="grid" style="gap:9px">'+notes.map(function(n){
+     return '<div style="display:grid;grid-template-columns:118px 1fr;gap:14px;padding:10px 0;border-top:1px solid var(--line)">'+
+       '<div><p class="lbl" style="margin:0 0 3px">'+esc(n.k)+'</p>'+
+       '<p class="tiny" style="margin:0;color:var(--ink);font-weight:600">'+esc(n.v)+'</p></div>'+
+       '<p class="tiny dim2" style="margin:0">'+esc(n.d)+'</p></div>';
+   }).join('')+'</div></div>':'')+
+
+  '<div class="card" style="margin-top:12px">'+
+  '<p class="lbl" style="margin-bottom:12px">Why this one</p>'+
+  '<div class="grid" style="gap:8px">'+r.reasons.filter(function(x){return x.why;}).slice(0,7).map(function(x){
+    var badge = x.src==='stage'?'stage':x.src==='mod'?'situation':x.src==='phrase'?'your words':'structure';
+    var col = x.src==='mod'?'var(--no)':x.src==='phrase'?'var(--cy)':'var(--muted)';
+    return '<div style="display:flex;gap:11px;align-items:flex-start;padding:9px 0;border-top:1px solid var(--line)">'+
+      '<span class="chip tiny" style="flex:none;color:'+col+';border-color:'+col+';background:transparent">'+badge+'</span>'+
+      '<p class="tiny dim2" style="margin:0;flex:1">'+x.why+'</p></div>';
+  }).join('')+'</div></div>'+
+
+  (r.ranked.length>1?'<div class="card" style="margin-top:12px">'+
+   '<p class="lbl" style="margin-bottom:5px">Also in play</p>'+
+   '<p class="tiny dim" style="margin-bottom:12px">Rarely one right answer. If the top pick feels wrong for this person, it is usually one of these — and hearing the difference is the actual skill.</p>'+
+   '<div class="grid gauto-s">'+r.ranked.slice(1).map(function(x){
+     return '<button class="btn sec" data-act="alt" data-arg="'+x.id+'" style="justify-content:flex-start;text-align:left;padding:11px 13px;height:100%">'+
+       '<span><b style="display:block;font-size:13px;color:'+FAMILIES[x.tone.fam].c+'">'+esc(x.tone.name)+'</b>'+
+       '<span class="tiny dim">'+x.pct+'% weight · '+esc(x.tone.conveys.slice(0,44))+'…</span></span></button>';
+   }).join('')+'</div></div>':'')+
+
+  ((r.warnings.length||r.locked.length)?'<div class="note no" style="margin-top:12px">'+
+   '<span class="l">Do not use these here</span>'+
+   (r.locked.length? r.locked.map(function(t2){return '<b>'+esc(t2.name)+'</b>';}).join(', ')+' — ruled out by the situation you flagged. ' : '')+
+   (r.warnings.length? r.warnings.slice(0,3).map(function(w){
+     return '<b>'+esc(TONE_BY_ID[w.tone].name)+'</b> ('+esc(w.why.toLowerCase())+')'; }).join(', ')+'.' : '')+
+   '</div>':'')+
+
+  '<p class="tiny dim" style="margin-top:14px">Matched '+r.fired+' phrase pattern'+(r.fired===1?'':'s')+
+  ' · '+(r.form.words||0)+' words · '+(r.form.isQuestion?'question':'statement')+
+  (r.form.hedges.length?' · '+r.form.hedges.length+' hedge'+(r.form.hedges.length>1?'s':'')+' detected':'')+
+  (r.form.contrast?' · contrastive':'')+'</p>';
+}
+
+
+UI.registerView('coach:after', function(){
+  var st=$('#cpStage'); if(st) st.onchange=function(){
+    CP.stage=this.value;
+    var s=STAGES.filter(function(x){return x.id===CP.stage;})[0];
+    var h=$('#cpStageHint'); if(h&&s) h.textContent=s.hint;
+  };
+  var ln=$('#cpLine'); if(ln) ln.oninput=function(){ CP.line=this.value; };
+  if(ln) ln.onkeydown=function(e){
+    if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); runAdvice(); }
+  };
+});
+
+function runAdvice(){
+  CP.res = advise({stage:CP.stage, line:CP.line, mods:CP.mods});
+  var out=$('#cpOut'); if(out) out.innerHTML=renderAdvice(CP.res);
+  else UI.render();
+}
+
+UI.registerView('coach:act', function(a, arg){
+  var s=S.raw();
+  if(a==='mod'){
+    var i=CP.mods.indexOf(arg);
+    if(i>=0) CP.mods.splice(i,1); else CP.mods.push(arg);
+    UI.render();
+    if(CP.res) runAdvice();
+  }
+  if(a==='run'){
+    var ln=$('#cpLine'); if(ln) CP.line=ln.value;
+    runAdvice();
+  }
+  if(a==='clear'){ CP.res=null; CP.line=''; CP.mods=[]; UI.render(); }
+  if(a==='alt'){
+    // promote an alternative to the top and re-render
+    var idx=-1; CP.res.ranked.forEach(function(x,j){ if(x.id===arg) idx=j; });
+    if(idx>0){ var picked=CP.res.ranked.splice(idx,1)[0]; CP.res.ranked.unshift(picked); }
+    $('#cpOut').innerHTML=renderAdvice(CP.res);
+  }
+  if(a==='drill'){
+    if(!CP.res) return;
+    Drill.launch('custom');
+  }
+  if(a==='save'){
+    if(!CP.res) return;
+    s.scenarios=(s.scenarios||[]).concat([{
+      line:CP.res.line||'(no line)', stage:CP.stage, mods:CP.mods.slice(),
+      tone:CP.res.ranked[0].id, at:Date.now()
+    }]).slice(-40);
+    S.save(); UI.toast('Scenario saved'); UI.render();
+  }
+  if(a==='load'){
+    var sc=(s.scenarios||[])[+arg]; if(!sc) return;
+    CP.stage=sc.stage; CP.line=sc.line; CP.mods=(sc.mods||[]).slice();
+    runAdvice(); UI.render(); runAdvice();
+  }
+  if(a==='del'){
+    (s.scenarios||[]).splice(+arg,1); S.save(); UI.render();
+  }
+  if(a==='wrong'){
+    s.advisorMisses=(s.advisorMisses||[]).concat([{
+      stage:CP.stage, line:CP.res.line, mods:CP.mods.slice(),
+      gave:CP.res.ranked[0].id, at:Date.now()
+    }]).slice(-60);
+    S.save();
+    UI.modal('<h2>Logged as a miss</h2>'+
+      '<p class="dim2" style="font-size:14.5px;margin-top:6px">Saved locally with the stage, your line and what it recommended. '+
+      'Nothing is sent anywhere.</p>'+
+      '<div class="note cy" style="margin-top:14px"><span class="l">Why this is worth doing</span>'+
+      'The rules engine can only match patterns it has been given. A handful of logged misses is exactly what is needed to add the missing rules — export them from Progress and send them over, and they become new triggers.</div>'+
+      '<p class="tiny dim" style="margin-top:12px">'+((s.advisorMisses||[]).length)+' logged so far.</p>'+
+      '<div class="row" style="margin-top:14px"><button class="btn" onclick="UI.closeModal()">Done</button></div>');
+  }
+});
+
 /* ---------- voice profile card ---------- */
 function profileCard(){
   var p=S.profile();

@@ -556,6 +556,77 @@ function mCalibrate(arg){
 }
 
 /* ============================================================
+   MODE: CUSTOM LINE
+   Drills the line the advisor was just given, in the tone it
+   recommended — then the runner-up, so the choice gets trained
+   and not just the execution.
+   ============================================================ */
+function mCustom(){
+  var res = (typeof CP!=='undefined' && CP.res) ? CP.res : null;
+  if(!res || !res.line){
+    UI.toast('Write a line in Custom Prompt first'); UI.go('coach'); return;
+  }
+  var primary=res.ranked[0].tone;
+  var alt=res.ranked[1]?res.ranked[1].tone:null;
+  var items=[
+    {t:primary, l:res.line, tag:'Recommended'},
+    {t:primary, l:res.line, tag:'Again — tighter'},
+    {t:primary, l:res.line, tag:'Third rep'}
+  ];
+  if(alt) items.push({t:alt, l:res.line, tag:'Now the alternative'});
+  items.push({t:primary, l:res.line, tag:'Back to the recommendation'});
+
+  D={i:0};
+  open('Your line · '+primary.name, items.length);
+
+  function draw(){
+    if(D.i>=items.length) return customEnd();
+    var it=items[D.i], t=it.t;
+    var notes = D.i===0 ? deliveryNotes(res) : [];
+    body('<div class="cue">'+toneChip(t)+
+      '<span class="chip tiny">'+esc(it.tag)+'</span>'+
+      (t.id!==primary.id?'<span class="chip cy tiny">compare against the recommendation</span>':'')+'</div>'+
+      '<p class="tiny dim2" style="margin:-6px 0 14px;max-width:70ch"><b style="color:var(--ink)">Cue:</b> '+esc(t.cue)+'</p>'+
+      '<p class="utter sm">'+(t.id===primary.id? markLine(res) : esc(res.line))+'</p>'+
+      (notes.length?'<div class="note acc" style="margin-bottom:14px">'+
+        notes.slice(0,3).map(function(n){ return '<b>'+esc(n.k)+':</b> '+esc(n.v); }).join('<br>')+'</div>':'')+
+      (t.id!==primary.id?'<div class="note cy" style="margin-bottom:14px"><span class="l">Why this rep matters</span>'+
+        'Same words, different intent. Being able to hear the gap between two plausible tones on your own sentence is the skill — picking the right one is downstream of being able to tell them apart.</div>':'')+
+      targetPills(t)+
+      recPanel({h:130}));
+    hint('<b>'+esc(t.recipe.terminal)+'</b>');
+    foot(D.i===items.length-1?'Finish →':'Next →');
+    wireRecorder(function(a){
+      var r=Audio.scoreAgainstTone(a, t, UI.words(it.l), S.raw().prefs.personalTargets);
+      if(!r) return;
+      var xp=S.recordRep(t.id, r.score, {wpm:r.wpm, span:a.span, term:a.term, floorDrop:a.floorDrop, baseHz:a.baseline});
+      D.results.push({tone:t, score:r.score, isAlt:t.id!==primary.id});
+      $('#result').innerHTML='<hr style="margin:20px 0 18px">'+
+        '<div class="scorewrap">'+UI.ring(r.score)+
+        '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score, t)+'</p>'+
+        '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · '+esc(t.name)+' mastery '+S.masteryOf(t.id)+'%</p></div></div>'+
+        UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins);
+      if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
+    }, {maxSec:26});
+  }
+  function customEnd(){
+    var main=D.results.filter(function(x){return !x.isAlt;}).map(function(x){return x.score;});
+    var altS=D.results.filter(function(x){return x.isAlt;}).map(function(x){return x.score;});
+    var avg=main.length?Math.round(main.reduce(function(a,b){return a+b;},0)/main.length):0;
+    var first=main[0], last=main[main.length-1];
+    end(avg+' on your line',
+      (main.length>1 && last>first ? 'Went from '+first+' to '+last+' across the session — that is the rep working. ' : '')+
+      (altS.length? 'You also ran it as '+alt.name+'. Play both back if you recorded them: the words never changed, and that gap is entirely tone. ' : '')+
+      'Save the scenario in Custom Prompt and it will be here next time.',
+      'custom line');
+  }
+  D.next=function(){ D.i++; draw(); };
+  D.prev=function(){ if(D.i>0){D.i--; draw();} };
+  D.restart=function(){ D.i=0; D.results=[]; draw(); };
+  draw();
+}
+
+/* ============================================================
    MODE: WARMUP
    ============================================================ */
 function mWarmup(){
@@ -1541,7 +1612,7 @@ function end(title, sub, name){
    launcher
    ============================================================ */
 var MODES={
-  calibrate:mCalibrate,
+  calibrate:mCalibrate, custom:mCustom,
   warmup:mWarmup, tonelab:mToneLab, terminal:mTerminal, monotone:mMonotone,
   pace:mPace, pausegym:mPause, floor:mFloor, twisters:mTwisters,
   emphasis:mEmphasis, contour:mContour, script:mScript, roulette:mRoulette,

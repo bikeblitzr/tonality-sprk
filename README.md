@@ -16,6 +16,7 @@ An optional Supabase backend adds accounts, cross-device sync and a team dashboa
 |---|---|
 | Calibration | Seven steps, nothing scored — noise floor, register, usable range, sibilant separation, and your **flat** baseline |
 | Custom Prompt | You give it the call stage and what you are about to say; it names the tone, the nucleus word and the contour, then drills it |
+| Reference playback | The model shape, your best take and your worst take, side by side on every tone |
 | The Warmup | 14-step mechanical routine — straw phonation, lip trills, DDK racks, breath benchmark |
 | Tone Lab | Full acoustic grade against a tone's target profile: pace, range, terminal, dynamics, silence |
 | Terminal Trainer | Pitch move over the final syllables, in semitones. Fall / rise / level on command |
@@ -44,6 +45,21 @@ An optional Supabase backend adds accounts, cross-device sync and a team dashboa
 **Power & Psychology** — 39 principles across six chapters (status, frame control, influence, decision biases, reading the room, self-command). Every one paired with the tone that delivers it, how it fails, and the counter-move for when it is used on you.
 
 **Progression** — 50 levels, per-tone mastery with time decay, streaks, 27 achievements, and a 90-day path.
+
+---
+
+## Nothing advances on its own
+
+There is no auto-advance. A scored rep raises a banner at the top of the stage — *All done, you can continue* — with two buttons: **Continue** or **Run it again**. Reading the numbers is most of the value of the rep, so the app never takes the page away from you mid-sentence, and repeating something you have already cleared is a first-class choice rather than a thing you have to fight the timer to do.
+
+## Three references, on every tone
+
+Sitting above the recorder before you have said a word:
+
+- **Hear the shape** — a synthesised model of the tone, driven from that tone's own target numbers. Pace from the wpm band, the size of the pitch lift from the semitone span, the direction and depth of the ending from the terminal target, real pauses at the phrase joints, and the accent on the nucleus word the advisor picks. Built on the browser's own speech synthesiser: no key, no account, no network, works offline. It is not a performance and does not pretend to be — it demonstrates the shape, not the timbre.
+- **Your best take** and **your worst take** of that tone, with the score on each and how long ago, plus a **Play both** button that runs worst then best back to back. Same words, same voice, and the entire difference is the thing being trained.
+
+Recordings are kept in IndexedDB on the device — 16 kHz mono, 12 seconds, two clips per tone, and only for the 20 most recently trained tones, so it tops out around 15 MB. **Still nothing is uploaded.** Settings shows how much is stored and deletes it all in one click.
 
 ---
 
@@ -146,6 +162,8 @@ src/
   17-data-brain.js      the authored knowledge spine behind the map
   20-audio.js           mic capture, pitch tracking, VAD, calibration, scoring
   25-cloud.js           Supabase client — auth, sync, telemetry queue, time tracking
+  26-clips.js           best/worst take per tone, kept on the device in IndexedDB
+  27-voice.js           the synthesised model of a tone, built from its targets
   30-state.js           persistence, XP, mastery decay, spaced repetition, remote merge
   40-ui-core.js         router, shell, canvases, modal, toasts, student/admin toggle
   50-drill.js           the stage — all 20 drill modes

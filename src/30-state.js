@@ -6,6 +6,7 @@
 
 var Store = (function(){
   var KEY='tonalitygym.v1';
+  var FLAG='tonalitygym.demoUnlock';
   var mem={};
   var ok=(function(){ try{ var k='__t'; localStorage.setItem(k,'1'); localStorage.removeItem(k); return true; }catch(e){ return false; } })();
   return {
@@ -17,7 +18,18 @@ var Store = (function(){
       if(!ok){ mem[KEY]=v; return; }
       try{ localStorage.setItem(KEY, JSON.stringify(v)); }catch(e){}
     },
-    clear:function(){ if(!ok){ mem={}; return; } try{ localStorage.removeItem(KEY); }catch(e){} },
+    clear:function(){ if(!ok){ mem={}; mem.FLAG=null; return; } try{ localStorage.removeItem(KEY); localStorage.removeItem(FLAG); }catch(e){} },
+    /* demo unlock lives in its own key. It is a presentation switch for
+       THIS browser, not progress — keeping it out of the synced blob means
+       no merge, no push and no key ordering can ever touch it. */
+    getDemo:function(){
+      if(!ok) return !!mem.FLAG;
+      try{ return localStorage.getItem(FLAG)==='1'; }catch(e){ return false; }
+    },
+    setDemo:function(v){
+      if(!ok){ mem.FLAG=!!v; return; }
+      try{ v?localStorage.setItem(FLAG,'1'):localStorage.removeItem(FLAG); }catch(e){}
+    },
     available:ok
   };
 })();
@@ -32,7 +44,7 @@ var S = (function(){
     streak:0, lastDay:null, bestStreak:0,
     hist:[],           // {ts, tone, score, wpm, span, term}
     prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true,
-           personalTargets:false, demoUnlock:false},
+           personalTargets:false},
     counters:{warmups:0, perfect:0, floorStreak:0, twCleared:0, gauntlets:0, gauntletBest:0, scripts:0},
     /* voice profile from calibration — see Audio.setProfile */
     profile:{done:false, at:null, noiseDb:null, modalHz:null, mpt:null, steadiness:null,
@@ -158,7 +170,7 @@ var S = (function(){
   }
 
   function tierUnlocked(tier){
-    if(s.prefs.demoUnlock) return true;      /* admin demo mode — every tier open */
+    if(demoUnlock()) return true;            /* admin demo mode — every tier open */
     var l=level();
     return tier<=1 || (tier===2 && l>=4) || (tier===3 && l>=9) || (tier===4 && l>=16);
   }
@@ -174,7 +186,8 @@ var S = (function(){
     if(window.UI && UI.paintHud) UI.paintHud();
     return level();
   }
-  function setDemoUnlock(on){ s.prefs.demoUnlock=!!on; save(); }
+  function demoUnlock(){ return Store.getDemo(); }
+  function setDemoUnlock(on){ Store.setDemo(!!on); }
   function tierNeed(tier){ return tier<=1?1:tier===2?4:tier===3?9:16; }
 
   /* achievements */
@@ -300,12 +313,8 @@ var S = (function(){
       s.profile=r.profile; if(window.Audio && Audio.setProfile) Audio.setProfile(r.profile);
     }
     if(r.prefs){
-      /* demo unlock is a presentation switch on THIS device, never progress.
-         Syncing it made a remote pull race the local toggle, so it is held
-         out of the merge entirely and restored from local afterwards. */
-      var localDemo = !!s.prefs.demoUnlock;
       s.prefs = Object.assign({}, r.prefs, s.prefs);
-      s.prefs.demoUnlock = localDemo;
+      delete s.prefs.demoUnlock;   /* legacy: it used to live here */
     }
     save();
   }
@@ -323,7 +332,7 @@ var S = (function(){
     saveProfile:saveProfile, profile:profile, clearProfile:clearProfile, profileDrift:profileDrift,
     mergeRemote:mergeRemote,
     weakQueue:weakQueue, tierUnlocked:tierUnlocked, tierNeed:tierNeed,
-    setLevel:setLevel, setDemoUnlock:setDemoUnlock,
+    setLevel:setLevel, setDemoUnlock:setDemoUnlock, demoUnlock:demoUnlock,
     grant:grant, checkAch:checkAch, noteMetric:noteMetric, stats:stats, touchDay:touchDay,
     reset:reset, exportJson:exportJson, importJson:importJson, today:today
   };

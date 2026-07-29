@@ -109,7 +109,7 @@ function paintHud(){
       '<button data-r="student" style="flex:1"'+(!adminMode?' class="on"':'')+'>Student</button>'+
       '<button data-r="admin" style="flex:1"'+(adminMode?' class="on"':'')+'>Admin</button></div>':'')+
     '<div class="hudtop"><span class="hudlvl">Level <i>'+p.lvl+'</i></span>'+
-      (s.prefs.demoUnlock?'<span class="hudrank" style="color:var(--acc)" title="Demo mode: every tier is unlocked regardless of level">DEMO</span>'
+      (S.demoUnlock()?'<span class="hudrank" style="color:var(--acc)" title="Demo mode: every tier is unlocked regardless of level">DEMO</span>'
                          :'<span class="hudrank">'+esc(p.rank)+'</span>')+'</div>'+
     '<div class="xpbar"><i style="width:'+p.pct.toFixed(1)+'%"></i></div>'+
     '<div class="hudsub"><span>'+p.cur+' / '+p.need+' xp</span><span><b>'+s.streak+'</b>d streak · <b>'+s.reps+'</b> reps</span></div>';
@@ -384,7 +384,7 @@ $('#settingsBtn').onclick=function(){
      ? '<hr><p class="lbl" style="margin-bottom:4px">Demo controls <span style="color:var(--acc)">· admin only</span></p>'+
        '<p class="tiny dim" style="margin:0 0 10px">For showing the app to a room. Level gating is pacing, not security — '+
        'what actually protects data is row-level security in the database, which these do not touch.</p>'+
-       '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setDemo"'+(s.prefs.demoUnlock?' checked':'')+'>'+
+       '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setDemo"'+(S.demoUnlock()?' checked':'')+'>'+
          '<span><b>Unlock everything</b><br><span class="dim tiny">Opens every drill, tone and tier regardless of level. '+
          'Nothing else changes — your real scores and mastery stay exactly as they are.</span></span></label>'+
        '<div class="f" style="margin-bottom:10px"><label class="lbl">Set level <span class="dim">(1–50, currently '+S.levelProgress().lvl+')</span></label>'+

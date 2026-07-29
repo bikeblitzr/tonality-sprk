@@ -81,7 +81,15 @@ function chunk(line, nucleusWord){
   return {parts:split, nuc:nucIdx};
 }
 
-/* Build the utterance plan from the tone's own targets. */
+/* Build the utterance plan from the tone's own targets.
+
+   The synthesiser takes one pitch per utterance, so a phrase cannot rise
+   onto the accent and then fall away inside itself. The fix is to split
+   the accented phrase at the nucleus word: the accent becomes its own
+   utterance, and whatever follows it becomes another, lower and quicker.
+   That is post-focus compression, and it is also what lets the terminal
+   actually land — otherwise an accent in the final phrase cancels the
+   fall and the model ends on a rise, which is the opposite of the cue. */
 function plan(line, tone, nucleusWord){
   var T = (tone && tone.target) || {};
   var wpm  = T.wpm  ? (T.wpm[0]+T.wpm[1])/2  : 150;
@@ -89,32 +97,66 @@ function plan(line, tone, nucleusWord){
   var term = T.term ? (T.term[0]+T.term[1])/2 : -5;
   var pauseTarget = T.pause ? (T.pause[0]+T.pause[1])/2 : 14;
 
-  /* rate 1.0 is roughly 160 wpm on most engines */
   var rate = clamp(wpm/160, 0.55, 1.55);
-  /* half the span above the line on the accent, half below on the tail —
-     which is what post-focus compression actually looks like */
   var lift = clamp(span/2, 1.5, 7);
   var gap  = clamp(260 + pauseTarget*22, 240, 900);
 
   var c = chunk(line, nucleusWord);
-  var last = c.parts.length-1;
-  return c.parts.map(function(text, i){
-    var pitch = 1, r = rate, post = gap;
-    if(i===c.nuc){                       /* the accented phrase */
-      pitch = stToPitch(lift);
-      r = rate*0.9;                      /* stressed syllables are longer */
-      post = gap*1.25;
-    } else if(i>c.nuc){                  /* everything after the focus */
-      pitch = stToPitch(-lift*0.45);
-      r = rate*1.05;
-      post = gap*0.8;
+  var steps = [];
+
+  c.parts.forEach(function(text, i){
+    if(i!==c.nuc){
+      var after = i>c.nuc;
+      steps.push({text:text,
+        st:   after ? -lift*0.45 : 0,
+        rate: after ? rate*1.05  : rate,
+        after: after ? gap*0.8 : gap});
+      return;
     }
-    if(i===last){                        /* land the terminal */
-      pitch = stToPitch((i===c.nuc?lift:0) + term*0.55);
-      r = rate*0.92;
-      post = 0;
+    /* the accented phrase — split it at the nucleus word */
+    var words = text.split(/\s+/);
+    var at = -1;
+    if(nucleusWord){
+      var nw = String(nucleusWord).toLowerCase().replace(/[^a-z0-9']/g,'');
+      for(var k=words.length-1;k>=0;k--){
+        if(words[k].toLowerCase().replace(/[^a-z0-9']/g,'')===nw){ at=k; break; }
+      }
     }
-    return {text:text, pitch:clamp(pitch,0.35,2), rate:clamp(r,0.4,1.8), after:post};
+    if(at<0) at = words.length-1;
+    var head = words.slice(0, at).join(' ');
+    var acc  = words.slice(at, at+1).join(' ');
+    var tail = words.slice(at+1).join(' ');
+
+    if(head) steps.push({text:head, st:0, rate:rate, after:90});
+    steps.push({text:acc, st:lift, rate:rate*0.86, after: tail?110:gap*1.1});
+    if(tail) steps.push({text:tail, st:-lift*0.45, rate:rate*1.05, after:gap*0.8});
+  });
+
+  /* a blank or punctuation-only line has nothing to say — never queue an
+     empty utterance, which some engines stall on */
+  steps = steps.filter(function(st){ return /[a-z0-9]/i.test(st.text||''); });
+  if(!steps.length) return [];
+
+  /* Land the ending. The terminal REPLACES whatever the final utterance
+     was going to do rather than adding to it — otherwise post-focus
+     compression drags a rising terminal back below the line and the rise,
+     which is the entire cue for a question tone, never appears. A residue
+     of the accent is kept when the accent itself is the last thing said,
+     since there is then nothing left to fall onto. */
+  var last = steps[steps.length-1];
+  var tEnd = term*0.55;
+  /* When the accent IS the last thing said, a little of the lift survives
+     so the word still reads as accented — but capped below half the
+     terminal's own size, so a wide-span tone can never lift hard enough to
+     invert the fall it is supposed to demonstrate. */
+  var residue = last.st>0 ? Math.min(last.st*0.4, Math.abs(tEnd)*0.45) : 0;
+  last.st = tEnd + residue;
+  last.rate = rate*0.92;
+  last.after = 0;
+
+  return steps.map(function(st){
+    return {text:st.text, pitch:clamp(stToPitch(st.st),0.35,2),
+            rate:clamp(st.rate,0.4,1.8), after:st.after};
   });
 }
 

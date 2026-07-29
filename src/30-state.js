@@ -299,7 +299,14 @@ var S = (function(){
     if(r.profile && r.profile.done && !(s.profile && s.profile.done)){
       s.profile=r.profile; if(window.Audio && Audio.setProfile) Audio.setProfile(r.profile);
     }
-    if(r.prefs) s.prefs=Object.assign({}, r.prefs, s.prefs);
+    if(r.prefs){
+      /* demo unlock is a presentation switch on THIS device, never progress.
+         Syncing it made a remote pull race the local toggle, so it is held
+         out of the merge entirely and restored from local afterwards. */
+      var localDemo = !!s.prefs.demoUnlock;
+      s.prefs = Object.assign({}, r.prefs, s.prefs);
+      s.prefs.demoUnlock = localDemo;
+    }
     save();
   }
 

@@ -142,6 +142,7 @@ function pushAll(immediate){
   var s = S.raw(), lp = S.levelProgress();
   var payload = JSON.parse(JSON.stringify(s));
   delete payload.advisorMisses;   // those go to their own table
+  if(payload.prefs) delete payload.prefs.demoUnlock;  // device-local, never synced
   payload.secondsActive = Math.round(totalSeconds());
 
   var jobs = [

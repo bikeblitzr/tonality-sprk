@@ -196,6 +196,38 @@ input[type=email],input[type=tel],select,textarea{
 /* labelled field: the label always sits above its control */
 .f .lbl{display:block;margin-bottom:5px}
 
+/* ---------- pass banner (replaces auto-advance) ---------- */
+.stbanner{display:none}
+.stbanner.on{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:11px 20px;border-bottom:1px solid var(--line);
+  background:linear-gradient(90deg, var(--ok-wash), transparent 70%);
+  animation:bannerIn .26s cubic-bezier(.22,1,.36,1)}
+.stbanner.on.warn{background:linear-gradient(90deg, rgba(232,176,75,.13), transparent 70%)}
+@keyframes bannerIn{from{opacity:0;transform:translateY(-7px)}to{opacity:1;transform:none}}
+.stbanner .bmark{width:20px;height:20px;border-radius:50%;flex:none;display:grid;place-items:center;
+  background:var(--ok);color:#08120c;font-size:12px;font-weight:800}
+.stbanner.warn .bmark{background:var(--acc);color:#1a1206}
+.stbanner b{font-size:14px}
+.stbanner .bsub{font-size:12.5px;color:var(--muted)}
+.stbanner .bspace{flex:1}
+@media (max-width:640px){ .stbanner.on{padding:10px 15px} .stbanner .bsub{width:100%} }
+
+/* ---------- saved reference clips ---------- */
+.clipstrip{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.clipstrip .cs{display:flex;gap:9px;flex-wrap:wrap;margin-top:9px}
+.clipbtn{display:flex;align-items:center;gap:9px;text-align:left;cursor:pointer;
+  background:var(--plane);border:1px solid var(--line);border-left-width:2px;border-radius:8px;
+  padding:8px 12px;transition:background .12s}
+.clipbtn:hover{background:var(--hi)}
+.clipbtn.best{border-left-color:var(--ok)}
+.clipbtn.worst{border-left-color:var(--no)}
+.clipbtn.model{border-left-color:var(--cy)}
+.clipbtn .ci{font-size:13px;width:14px;flex:none}
+.clipbtn b{display:block;font-size:12.5px;line-height:1.3}
+.clipbtn span{display:block;font-size:11px;color:var(--muted)}
+.clipbtn.playing{background:var(--hi)}
+.clipbtn[disabled]{opacity:.45;cursor:default}
+
 /* ---------- the brain map ---------- */
 .brainwrap{display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:0;height:100dvh;min-height:0}
 .braincanvas{position:relative;overflow:hidden;background:

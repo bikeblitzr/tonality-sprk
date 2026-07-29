@@ -365,8 +365,6 @@ $('#settingsBtn').onclick=function(){
    '<div class="sect" style="margin-top:16px">'+
    '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setHard"'+(s.prefs.hardMode?' checked':'')+'>'+
      '<span><b>Hard mode</b><br><span class="dim tiny">Tighter score bands and no partial credit on terminals. Turn this on once you are consistently above 80.</span></span></label>'+
-   '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setAuto"'+(s.prefs.autoNext?' checked':'')+'>'+
-     '<span><b>Auto-advance</b><br><span class="dim tiny">Move to the next item automatically after a scored rep.</span></span></label>'+
    '<label class="ck" style="margin-bottom:16px"><input type="checkbox" id="setNums"'+(s.prefs.showNums?' checked':'')+'>'+
      '<span><b>Show live numbers</b><br><span class="dim tiny">Live pitch and level readouts during recording. Turn off if it distracts you.</span></span></label>'+
    '<hr><p class="lbl" style="margin-bottom:10px">Your voice</p>'+
@@ -394,6 +392,10 @@ $('#settingsBtn').onclick=function(){
        '<div class="row" style="margin-bottom:16px"><button class="btn gh sm" id="xp1k" data-xp="1000">+1,000 XP</button>'+
        '<button class="btn gh sm" id="xp10k" data-xp="10000">+10,000 XP</button></div>'
      : '')+
+   '<hr><p class="lbl" style="margin-bottom:8px">Saved recordings</p>'+
+   '<p class="tiny dim" style="margin:0 0 10px" id="clipStat">Your best and worst take of each tone are kept in this browser so you can play them back and compare. '+
+   'They are never uploaded. Checking\u2026</p>'+
+   '<div class="row" style="margin-bottom:16px"><button class="btn sec sm" id="clipClear">Delete saved recordings</button></div>'+
    '<hr><p class="lbl" style="margin-bottom:8px">Your data</p>'+
    '<div class="row"><button class="btn sec sm" id="expBtn">Export progress</button>'+
    '<button class="btn sec sm" id="impBtn">Import</button>'+
@@ -401,7 +403,6 @@ $('#settingsBtn').onclick=function(){
    (Store.available?'':'<div class="note no" style="margin-top:12px"><span class="l">Heads up</span>Local storage is blocked in this browser, so progress will not survive a reload.</div>')+
    '</div>');
   $('#setHard').onchange=function(){ s.prefs.hardMode=this.checked; S.save(); };
-  $('#setAuto').onchange=function(){ s.prefs.autoNext=this.checked; S.save(); };
   $('#setNums').onchange=function(){ s.prefs.showNums=this.checked; S.save(); };
   if($('#setPersonal')) $('#setPersonal').onchange=function(){
     s.prefs.personalTargets=this.checked; S.save();
@@ -424,6 +425,20 @@ $('#settingsBtn').onclick=function(){
   ['#xp1k','#xp10k'].forEach(function(sel){
     if($(sel)) $(sel).onclick=function(){ S.addXp(parseInt(this.dataset.xp,10), 'demo'); closeModal(); render(); };
   });
+  if($('#clipStat') && window.Clips){
+    if(!Clips.supported){ $('#clipStat').textContent='This browser will not keep recordings between sessions, so the comparison clips are unavailable here.'; }
+    else Clips.stats().then(function(st){
+      var el2=$('#clipStat'); if(!el2) return;
+      el2.innerHTML = st.clips
+        ? '<b>'+st.clips+'</b> recording'+(st.clips===1?'':'s')+' across <b>'+st.tones+'</b> tone'+(st.tones===1?'':'s')+', '+
+          (st.bytes/1048576).toFixed(1)+' MB. Your best and worst take of each tone, kept in this browser so you can play them back and compare. Never uploaded.'
+        : 'Nothing saved yet. Once you score a tone, your best and worst take are kept in this browser so you can play them back and compare. Never uploaded.';
+    });
+  }
+  if($('#clipClear')) $('#clipClear').onclick=function(){
+    if(!confirm('Delete every saved recording? Your scores and progress are not affected.')) return;
+    Clips.clearAll().then(function(){ toast('Saved recordings deleted'); closeModal(); });
+  };
   $('#calBtn').onclick=function(){ closeModal(); needMic().then(function(ok){ if(ok) Drill.launch('calibrate','redo'); }); };
   if($('#calClear')) $('#calClear').onclick=function(){
     if(confirm('Clear your voice profile? The pitch tracker goes back to searching the full range for everyone, and the "vs your baseline" readouts disappear.')){

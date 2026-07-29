@@ -805,18 +805,44 @@ function waveform(nPoints){
 function hasRecording(){ return !!(lastBuf||chunks.length); }
 
 /* export as wav */
-function exportWav(){
-  var b=lastBuf||buildBuffer();
-  if(!b) return null;
-  var d=b.getChannelData(0), len=d.length;
+function wavFrom(d, rate){
+  var len=d.length;
   var buf=new ArrayBuffer(44+len*2), view=new DataView(buf);
   function ws(o,s){ for(var i=0;i<s.length;i++) view.setUint8(o+i,s.charCodeAt(i)); }
   ws(0,'RIFF'); view.setUint32(4,36+len*2,true); ws(8,'WAVE'); ws(12,'fmt ');
   view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true);
-  view.setUint32(24,SR,true); view.setUint32(28,SR*2,true); view.setUint16(32,2,true);
+  view.setUint32(24,rate,true); view.setUint32(28,rate*2,true); view.setUint16(32,2,true);
   view.setUint16(34,16,true); ws(36,'data'); view.setUint32(40,len*2,true);
-  for(var i=0;i<len;i++){ var s=clamp(d[i],-1,1); view.setInt16(44+i*2, s<0?s*0x8000:s*0x7FFF, true); }
+  for(var i=0;i<len;i++){ var v=clamp(d[i],-1,1); view.setInt16(44+i*2, v<0?v*0x8000:v*0x7FFF, true); }
   return new Blob([view],{type:'audio/wav'});
+}
+function exportWav(){
+  var b=lastBuf||buildBuffer();
+  if(!b) return null;
+  return wavFrom(b.getChannelData(0), SR);
+}
+/* A smaller copy for keeping on the device. Speech carries essentially
+   everything a listener needs below 8 kHz, so 16 kHz mono is transparent
+   for comparing two of your own takes and is about a twentieth the size.
+   Box-averaging across each output sample is a crude but adequate
+   anti-alias filter — plenty for playback, and it never touches the copy
+   that gets analysed. */
+function exportWavSmall(maxSec, rate){
+  var b=lastBuf||buildBuffer();
+  if(!b) return null;
+  rate = rate||16000;
+  var d=b.getChannelData(0);
+  var srcLen = maxSec ? Math.min(d.length, Math.round(maxSec*SR)) : d.length;
+  if(rate>=SR) return wavFrom(d.subarray(0,srcLen), SR);
+  var ratio = SR/rate, outLen = Math.floor(srcLen/ratio);
+  if(outLen<8) return null;
+  var out = new Float32Array(outLen);
+  for(var i=0;i<outLen;i++){
+    var st=Math.floor(i*ratio), en=Math.min(srcLen, Math.floor((i+1)*ratio)), acc=0, n=0;
+    for(var j=st;j<en;j++){ acc+=d[j]; n++; }
+    out[i] = n ? acc/n : 0;
+  }
+  return wavFrom(out, rate);
 }
 
 /* ---------- events ---------- */
@@ -835,7 +861,7 @@ return {
   scorePace:scorePace, scoreRange:scoreRange, scoreFloor:scoreFloor, scorePauses:scorePauses,
   contourTrace:contourTrace, scoreContour:scoreContour,
   snapshot:snapshot, play:play, stopPlay:stopPlay, waveform:waveform, hasRecording:hasRecording,
-  exportWav:exportWav, hzToSt:hzToSt, pct:pct, median:median, mean:mean
+  exportWav:exportWav, exportWavSmall:exportWavSmall, hzToSt:hzToSt, pct:pct, median:median, mean:mean
 };
 })();
 </script>

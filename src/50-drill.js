@@ -69,6 +69,8 @@ function close(){
   if(scope){ scope.stop(); scope=null; }
   if(Audio.isCapturing()) Audio.endCapture();
   Audio.stopPlay();
+  if(window.ModelVoice) ModelVoice.stop();
+  if(window.Clips) Clips.stop();
   D=null;
   UI.render();
 }
@@ -77,8 +79,123 @@ function paintTop(){
   $('#stPos').textContent = D.total ? (Math.min(D.i+1,D.total)+' / '+D.total) : '';
   $('#stProg').style.width = D.total ? (D.i/D.total*100)+'%' : '0%';
 }
-function body(h){ $('#stBody').innerHTML=h; paintTop(); }
+function body(h){ $('#stBody').innerHTML=h; clearBanner(); paintTop(); }
 function hint(h){ $('#stHint').innerHTML=h||''; }
+
+/* ---------------- the pass banner ----------------
+   Nothing in this app advances on its own. When a rep clears the bar you
+   get told, and then it is your call: move on, or stay here and run it
+   again. Reading the feedback is most of the value of the rep. */
+function clearBanner(){ var b=$('#stBanner'); if(b){ b.className='stbanner'; b.innerHTML=''; } }
+function passBanner(ok, opts){
+  opts=opts||{};
+  var b=$('#stBanner'); if(!b) return;
+  var last = D && D.total && D.i>=D.total-1;
+  b.className='stbanner on'+(ok?'':' warn');
+  b.innerHTML=
+    '<span class="bmark">'+(ok?'✓':'·')+'</span>'+
+    '<b>'+UI.esc(opts.title || (ok?'All done — you can continue.':'Logged. Take another run at it when you are ready.'))+'</b>'+
+    '<span class="bsub">'+UI.esc(opts.sub || (ok
+      ? 'Or stay here and run it again — repeating a rep you already cleared is how it becomes automatic.'
+      : 'Read the numbers below, then record again. You can also move on and come back to it.'))+'</span>'+
+    '<span class="bspace"></span>'+
+    '<button class="btn gh sm" data-bn="again">Run it again</button>'+
+    '<button class="btn'+(ok?'':' sec')+' sm" data-bn="next">'+(last?'Finish':'Continue')+' →</button>';
+  b.onclick=function(e){
+    var t=e.target.closest('[data-bn]'); if(!t) return;
+    if(t.dataset.bn==='next'){ clearBanner(); if(D&&D.next) D.next(); }
+    else { clearBanner(); if(D&&D.redo) D.redo(); }
+  };
+}
+
+/* ---------------- the reference row ----------------
+   Three ways to hear the target before and after you record it:
+   a synthesised model of the shape, your best take, and your worst.
+   Rendered in the body so it is there before the first rep, and
+   refreshed in place whenever a new best or worst lands. */
+function refRow(tone, line){
+  var id='rf'+Math.random().toString(36).slice(2,8);
+  setTimeout(function(){ fillRef(id, tone, line); },0);
+  return '<div id="'+id+'" data-ref="1"></div>';
+}
+function fillRef(id, tone, line){
+  var w=document.getElementById(id); if(!w) return;
+  var toneId = tone && tone.id;
+  /* gate on support, not on the voice list — engines populate voices
+     asynchronously and the row can render before that lands */
+  var hasModel = !!(window.ModelVoice && ModelVoice.supported);
+  var get = (window.Clips && Clips.supported && toneId) ? Clips.get(toneId) : Promise.resolve(null);
+  get.then(function(rec){
+    if(!w.isConnected) return;
+    rec = rec||{};
+    if(!hasModel && !rec.best && !rec.worst){ w.innerHTML=''; return; }
+    var both = rec.best && rec.worst;
+    function clip(kind, e){
+      if(!e) return '';
+      return '<button class="clipbtn '+kind+'" data-ref-play="'+kind+'">'+
+        '<span class="ci">▶</span><span><b>Your '+(kind==='best'?'best':'worst')+' — '+e.score+'</b>'+
+        '<span>'+ago(e.at)+'</span></span></button>';
+    }
+    w.innerHTML='<div class="clipstrip">'+
+      '<p class="lbl" style="color:var(--acc);margin:0">Reference</p>'+
+      '<div class="cs">'+
+        (hasModel?'<button class="clipbtn model" data-ref-play="model">'+
+          '<span class="ci">♪</span><span><b>Hear the shape</b><span>synthesised from this tone\'s targets</span></span></button>':'')+
+        clip('best',rec.best)+clip('worst',rec.worst)+
+        (both?'<button class="clipbtn" data-ref-play="ab"><span class="ci">⇄</span><span><b>Play both</b><span>worst, then best</span></span></button>':'')+
+      '</div>'+
+      '<p class="tiny dim" style="margin:9px 0 0">'+
+      (hasModel?'The model is a synthesiser, not a performance — it demonstrates the pace, the pauses, which word takes the accent and which way the ending moves. Copy the shape, not the timbre. ':'')+
+      (both?'Your two takes are '+(rec.best.score-rec.worst.score)+' points apart. Listen for what actually changed between them — it is almost always the terminal and how far the pitch travelled, not the volume. ':
+        (rec.best||rec.worst)?'One take saved so far. Record a clearly better or worse one and the pair fills in. ':'')+
+      'Your recordings are kept on this device only and never uploaded.</p></div>';
+
+    var playing=null;
+    function reset(){
+      Array.prototype.forEach.call(w.querySelectorAll('.clipbtn'), function(x){ x.classList.remove('playing'); });
+      playing=null;
+    }
+    w.onclick=function(e){
+      var t=e.target.closest('[data-ref-play]'); if(!t) return;
+      var k=t.dataset.refPlay, was=playing;
+      if(window.Clips) Clips.stop();
+      if(window.ModelVoice) ModelVoice.stop();
+      reset();
+      if(was===k) return;
+      playing=k; t.classList.add('playing');
+      if(k==='model'){
+        var nuc=null;
+        try{ var f=analyseForm(line); var n=findNucleus(line,f); nuc=n&&n.word; }catch(err){}
+        var ok=ModelVoice.speak(line, tone, {nucleus:nuc, onEnd:reset});
+        if(!ok){ reset(); UI.toast('This browser has no speech voice installed — the model shape is unavailable here.'); }
+      } else if(k==='ab'){
+        Clips.play(rec.worst.blob, function(){
+          if(playing!=='ab') return;
+          setTimeout(function(){ if(playing==='ab') Clips.play(rec.best.blob, reset); }, 420);
+        });
+      } else {
+        Clips.play(rec[k].blob, reset);
+      }
+    };
+  });
+}
+function ago(ts){
+  var m=(Date.now()-ts)/60000;
+  if(m<1) return 'just now';
+  if(m<60) return Math.round(m)+' min ago';
+  var h=m/60; if(h<24) return Math.round(h)+(Math.round(h)===1?' hour ago':' hours ago');
+  var d=Math.round(h/24); return d===1?'yesterday':d+' days ago';
+}
+/* save the take, then refresh the row in place so a new best appears at once */
+function keepClip(tone, score, line){
+  if(!window.Clips || !Clips.supported || !tone) return;
+  Clips.record(tone.id, score, {line:line}).then(function(r){
+    if(!r || (!r.best && !r.worst)) return;
+    var host=document.querySelector('[data-ref="1"]');
+    if(host) fillRef(host.id, tone, line);
+  });
+}
+
 function foot(nextLabel, showPrev){
   $('#stNext').textContent=nextLabel||'Next →';
   $('#stPrev').style.display = showPrev===false ? 'none' : '';
@@ -150,6 +267,8 @@ function wireRecorder(onDone, opts){
   function begin(){
     if(!Audio.ready()){ UI.needMic().then(function(ok){ if(ok){ startScope(opts.baseline); begin(); } }); return; }
     recording=true;
+    if(window.ModelVoice) ModelVoice.stop();
+    if(window.Clips) Clips.stop();
     Audio.beginCapture({spectra: !!opts.spectra});
     rec.textContent='■ Stop'; rec.classList.remove('sec');
     $('#ovLeft').textContent='recording';
@@ -347,7 +466,7 @@ function mCalibrate(arg){
           {k:'Spread', v:Math.round(r.spread), u:'dB', s:0.7}
         ])+
         '<div class="note '+(r.ok?'ok':'no')+'" style="margin-top:12px"><span class="l">'+(r.ok?'Good':'Worth fixing')+'</span>'+esc(r.verdict)+'</div>';
-      if(S.raw().prefs.autoNext && r.ok) setTimeout(function(){ if(D) D.next(); }, 1800);
+      passBanner(!!r.ok);
     }, {maxSec:5});
   }
 
@@ -374,7 +493,7 @@ function mCalibrate(arg){
         '<b>Breath support:</b> '+(mptGood?'Strong. Above eighteen seconds is good support — you should not be running out of air at the end of sentences.':
           mptOk?'Solid. Twelve to eighteen seconds is a normal range. The volume-floor drill will still be worth doing.':
           'Short. Under twelve seconds usually means the breath is running out before the sentence does, which is the most common cause of trailing off. The warmup rack and the volume-floor drill both target this directly.')+'</div>';
-      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2600);
+      passBanner(true);
     }, {maxSec:26});
   }
 
@@ -403,7 +522,7 @@ function mCalibrate(arg){
         '<div class="note ok" style="margin-top:12px"><span class="l">Tracker narrowed</span>'+
         'Search window is now <b>'+Math.round(b.lo)+'–'+Math.round(b.hi)+' Hz</b> instead of 60–900. '+
         'That is roughly a '+Math.round((1-(b.hi-b.lo)/840)*100)+'% narrower search, which means substantially fewer octave errors on every rep from here on — and it runs faster too.</div>';
-      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2600);
+      passBanner(true);
     }, {maxSec:22});
   }
 
@@ -477,7 +596,7 @@ function mCalibrate(arg){
           {k:'Dynamics', v:r.dyn.toFixed(1), u:'dB', s:0.8},
           {k:'Silence', v:Math.round(r.pauseFrac), u:'%', s:0.8}
         ])+cmp;
-      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, cmp?3000:2200);
+      passBanner(true);
     }, {maxSec:24});
   }
 
@@ -619,6 +738,7 @@ function mCustom(){
       (t.id!==primary.id?'<span class="chip cy tiny">compare against the recommendation</span>':'')+'</div>'+
       '<p class="tiny dim2" style="margin:-6px 0 14px;max-width:70ch"><b style="color:var(--ink)">Cue:</b> '+esc(t.cue)+'</p>'+
       '<p class="utter sm">'+(t.id===primary.id? markLine(res) : esc(res.line))+'</p>'+
+      refRow(t, res.line)+
       (notes.length?'<div class="note acc" style="margin-bottom:14px">'+
         notes.slice(0,3).map(function(n){ return '<b>'+esc(n.k)+':</b> '+esc(n.v); }).join('<br>')+'</div>':'')+
       (t.id!==primary.id?'<div class="note cy" style="margin-bottom:14px"><span class="l">Why this rep matters</span>'+
@@ -637,7 +757,8 @@ function mCustom(){
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score, t)+'</p>'+
         '<p class="tiny dim" style="margin-top:6px">+'+xp+' xp · '+esc(t.name)+' mastery '+S.masteryOf(t.id)+'%</p></div></div>'+
         UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins);
-      if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
+      keepClip(t, r.score, it.l);
+      passBanner(r.score>=72);
     }, {maxSec:26});
   }
   function customEnd(){
@@ -713,6 +834,7 @@ function mToneLab(arg){
     var it=items[D.i], t=it.t;
     body(cueBlock(t)+targetPills(t)+
       '<p class="utter">'+esc(it.l)+'</p>'+
+      refRow(t, it.l)+
       recPanel({label:'ready', h:140}));
     hint('<b>Non-negotiable:</b> '+esc(t.recipe.terminal));
     foot(D.i===items.length-1?'Finish →':'Next →');
@@ -731,7 +853,8 @@ function mToneLab(arg){
         (r.personalised?' · <span style="color:var(--cy)">personal bands</span>':'')+'</p></div></div>'+
         UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults, r.wins)+fairnessStrip(t, r.score, a);
       $('#recNote').textContent='Press R to redo, → for next.';
-      if(S.raw().prefs.autoNext && r.score>=72) setTimeout(function(){ if(D) D.next(); }, 2600);
+      keepClip(t, r.score, it.l);
+      passBanner(r.score>=72);
     }, {maxSec:22});
     D.next=function(){ D.i++; draw(); };
     D.prev=function(){ if(D.i>0){D.i--; draw();} };
@@ -800,7 +923,7 @@ function mTerminal(){
           {k:'Range',v:a.span.toFixed(1),u:'st',s:a.span>=4?1:0.3}
         ])+
         (a.floorDrop>4.5?UI.faultList([{t:'bad',b:'You trailed off',s:'A fall in pitch is not the same as a fall in energy. Keep the intensity within 4 dB of the average right through the last consonant.'}]):'');
-      if(S.raw().prefs.autoNext && r.ok) setTimeout(function(){ if(D) D.next(); }, 1700);
+      passBanner(!!r.ok);
     }, {maxSec:14});
   }
   D.next=function(){ D.i++; draw(); };
@@ -845,7 +968,7 @@ function mMonotone(){
           {k:'High point',v:a.highSt.toFixed(1),u:'st',s:.7},
           {k:'Base',v:Math.round(a.baseline),u:'Hz',s:.7}
         ]);
-      if(S.raw().prefs.autoNext && a.span>=it.t) setTimeout(function(){ if(D) D.next(); }, 1900);
+      passBanner(a.span>=it.t);
     }, {maxSec:16});
   }
   D.next=function(){ D.i++; draw(); };
@@ -890,7 +1013,7 @@ function mPace(){
           {k:'Pauses',v:a.pauseCount,u:'',s:.7}
         ])+
         (a.pauseFrac<10?UI.faultList([{t:'warn',b:'Rate without pause',s:'You can hit a word count and still sound rushed. Under 10% silence is the acoustic signature of rushing regardless of wpm.'}]):'');
-      if(S.raw().prefs.autoNext && r.ok) setTimeout(function(){ if(D) D.next(); }, 1800);
+      passBanner(!!r.ok);
     }, {maxSec:26});
   }
   function drawPacer(band){
@@ -1003,7 +1126,7 @@ function mFloor(){
           {k:'Dynamics',v:a.dyn.toFixed(1),u:'dB',s:.7}
         ])+
         (a.fryPct>28?UI.faultList([{t:'warn',b:'Creak at the end',s:'You dropped below your modal floor on '+Math.round(a.fryPct)+'% of voiced frames. That is a breath problem — take the breath at the previous clause boundary.'}]):'');
-      if(S.raw().prefs.autoNext && r.ok) setTimeout(function(){ if(D) D.next(); }, 1700);
+      passBanner(!!r.ok);
     }, {maxSec:16});
   }
   D.next=function(){ D.i++; draw(); };
@@ -1236,7 +1359,7 @@ function mScript(arg){
         '<div class="scorewrap">'+UI.ring(r.score)+
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3><p>'+verdictLine(r.score,t)+'</p></div></div>'+
         UI.readouts(r.parts)+UI.faultList(r.faults.slice(0,2), r.wins.slice(0,1));
-      if(S.raw().prefs.autoNext && r.score>=70) setTimeout(function(){ if(D) D.next(); }, 2200);
+      passBanner(r.score>=70);
     }, {maxSec:24});
   }
   D.next=function(){ D.i++; draw(); };
@@ -1276,7 +1399,7 @@ function mRoulette(){
         '<div class="verdict"><h3>'+verdictTitle(r.score)+'</h3>'+
         '<p><b style="color:var(--ink)">Cue was:</b> '+esc(it.t.cue)+'</p></div></div>'+
         UI.readouts(r.parts)+baselineStrip(r)+UI.faultList(r.faults.slice(0,2));
-      if(S.raw().prefs.autoNext) setTimeout(function(){ if(D) D.next(); }, 2600);
+      passBanner(true);
     }, {maxSec:16});
   }
   D.next=function(){ D.i++; draw(); };

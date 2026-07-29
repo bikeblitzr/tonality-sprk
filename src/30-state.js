@@ -43,7 +43,7 @@ var S = (function(){
     ach:{}, day:1, dayDone:{},
     streak:0, lastDay:null, bestStreak:0,
     hist:[],           // {ts, tone, score, wpm, span, term}
-    prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true,
+    prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, showNums:true,
            personalTargets:false},
     counters:{warmups:0, perfect:0, floorStreak:0, twCleared:0, gauntlets:0, gauntletBest:0, scripts:0},
     /* voice profile from calibration — see Audio.setProfile */

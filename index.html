@@ -8012,7 +8012,7 @@ UI.registerView('home:act', function(a){
 UI.registerView('modules', function(){
   return '<div class="page">'+
   '<div class="phead"><p class="kick">Every drill</p><h1>All Drills</h1>'+
-  '<p class="lede">Eighteen training modes. Each one isolates a different parameter of the voice and grades it against a measurable target. '+
+  '<p class="lede">'+MODULES.length+' training modes. Each one isolates a different parameter of the voice and grades it against a measurable target. '+
   'Locked ones open as you level up — not to gate you, but because drilling the Defect Lab before you can produce a clean terminal is wasted time.</p></div>'+
   '<div class="mods">'+MODULES.map(modCard).join('')+'</div>'+
   '<div class="sect"><div class="shead"><h2>Drill a whole family</h2></div>'+

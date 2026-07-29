@@ -65,7 +65,9 @@ var NAV=[
 {g:'You'},
 {id:'path',      ic:'⟶', n:'90-Day Path'},
 {id:'progress',  ic:'▲', n:'Progress'},
-{id:'account',   ic:'◍', n:'Account'}
+{id:'account',   ic:'◍', n:'Account'},
+{g:'Under the hood'},
+{id:'brain',     ic:'❋', n:'See how this works'}
 ];
 var NAV_ADMIN=[
 {g:'Admin'},
@@ -73,7 +75,9 @@ var NAV_ADMIN=[
 {g:'Your own training'},
 {id:'home',      ic:'◉', n:'Today'},
 {id:'progress',  ic:'▲', n:'Progress'},
-{id:'account',   ic:'◍', n:'Account'}
+{id:'account',   ic:'◍', n:'Account'},
+{g:'Under the hood'},
+{id:'brain',     ic:'❋', n:'See how this works'}
 ];
 
 var view='home', viewArg=null;
@@ -104,7 +108,9 @@ function paintHud(){
     (admin?'<div class="seg" style="width:100%;margin:0 0 10px;display:flex" id="roleSeg">'+
       '<button data-r="student" style="flex:1"'+(!adminMode?' class="on"':'')+'>Student</button>'+
       '<button data-r="admin" style="flex:1"'+(adminMode?' class="on"':'')+'>Admin</button></div>':'')+
-    '<div class="hudtop"><span class="hudlvl">Level <i>'+p.lvl+'</i></span><span class="hudrank">'+esc(p.rank)+'</span></div>'+
+    '<div class="hudtop"><span class="hudlvl">Level <i>'+p.lvl+'</i></span>'+
+      (s.prefs.demoUnlock?'<span class="hudrank" style="color:var(--acc)" title="Demo mode: every tier is unlocked regardless of level">DEMO</span>'
+                         :'<span class="hudrank">'+esc(p.rank)+'</span>')+'</div>'+
     '<div class="xpbar"><i style="width:'+p.pct.toFixed(1)+'%"></i></div>'+
     '<div class="hudsub"><span>'+p.cur+' / '+p.need+' xp</span><span><b>'+s.streak+'</b>d streak · <b>'+s.reps+'</b> reps</span></div>';
   var seg=$('#roleSeg');
@@ -374,6 +380,20 @@ $('#settingsBtn').onclick=function(){
      : '<p class="tiny dim2" style="margin-bottom:10px">Not calibrated yet. Two minutes, and every score afterwards is measured more accurately.</p>')+
    '<div class="row" style="margin-bottom:16px"><button class="btn sec sm" id="calBtn">'+(S.profile()?'Re-run calibration':'Calibrate my voice')+'</button>'+
    (S.profile()?'<button class="btn gh sm" id="calClear">Clear profile</button>':'')+'</div>'+
+   ((window.Cloud && Cloud.isAdmin && Cloud.isAdmin())
+     ? '<hr><p class="lbl" style="margin-bottom:4px">Demo controls <span style="color:var(--acc)">· admin only</span></p>'+
+       '<p class="tiny dim" style="margin:0 0 10px">For showing the app to a room. Level gating is pacing, not security — '+
+       'what actually protects data is row-level security in the database, which these do not touch.</p>'+
+       '<label class="ck" style="margin-bottom:12px"><input type="checkbox" id="setDemo"'+(s.prefs.demoUnlock?' checked':'')+'>'+
+         '<span><b>Unlock everything</b><br><span class="dim tiny">Opens every drill, tone and tier regardless of level. '+
+         'Nothing else changes — your real scores and mastery stay exactly as they are.</span></span></label>'+
+       '<div class="f" style="margin-bottom:10px"><label class="lbl">Set level <span class="dim">(1–50, currently '+S.levelProgress().lvl+')</span></label>'+
+       '<div class="row"><input type="number" id="setLvl" min="1" max="50" value="'+S.levelProgress().lvl+'" style="max-width:110px">'+
+       '<button class="btn sec sm" id="lvlGo">Apply</button>'+
+       '<button class="btn gh sm" id="lvlMax">Max out</button></div></div>'+
+       '<div class="row" style="margin-bottom:16px"><button class="btn gh sm" id="xp1k" data-xp="1000">+1,000 XP</button>'+
+       '<button class="btn gh sm" id="xp10k" data-xp="10000">+10,000 XP</button></div>'
+     : '')+
    '<hr><p class="lbl" style="margin-bottom:8px">Your data</p>'+
    '<div class="row"><button class="btn sec sm" id="expBtn">Export progress</button>'+
    '<button class="btn sec sm" id="impBtn">Import</button>'+
@@ -388,6 +408,22 @@ $('#settingsBtn').onclick=function(){
     toast(this.checked ? 'Personal Mode <b>on</b> — scores are no longer comparable between people'
                        : 'Personal Mode <b>off</b> — back to the fixed standard');
   };
+  if($('#setDemo')) $('#setDemo').onchange=function(){
+    S.setDemoUnlock(this.checked); render();
+    toast(this.checked ? 'Demo mode <b>on</b> — everything unlocked' : 'Demo mode <b>off</b> — normal gating restored');
+  };
+  if($('#lvlGo')) $('#lvlGo').onclick=function(){
+    var v=parseInt($('#setLvl').value,10);
+    if(!(v>=1&&v<=50)){ toast('Pick a level between 1 and 50'); return; }
+    var l=S.setLevel(v); closeModal(); render(); toast('You are now <b>level '+l+'</b>');
+  };
+  if($('#lvlMax')) $('#lvlMax').onclick=function(){
+    var l=S.setLevel(50); S.setDemoUnlock(true); closeModal(); render();
+    toast('<b>Level '+l+'</b> · everything unlocked');
+  };
+  ['#xp1k','#xp10k'].forEach(function(sel){
+    if($(sel)) $(sel).onclick=function(){ S.addXp(parseInt(this.dataset.xp,10), 'demo'); closeModal(); render(); };
+  });
   $('#calBtn').onclick=function(){ closeModal(); needMic().then(function(ok){ if(ok) Drill.launch('calibrate','redo'); }); };
   if($('#calClear')) $('#calClear').onclick=function(){
     if(confirm('Clear your voice profile? The pitch tracker goes back to searching the full range for everyone, and the "vs your baseline" readouts disappear.')){

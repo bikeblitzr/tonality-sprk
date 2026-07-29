@@ -32,7 +32,7 @@ var S = (function(){
     streak:0, lastDay:null, bestStreak:0,
     hist:[],           // {ts, tone, score, wpm, span, term}
     prefs:{theme:'dark', ref:'auto', voice:'unset', hardMode:false, autoNext:true, showNums:true,
-           personalTargets:false},
+           personalTargets:false, demoUnlock:false},
     counters:{warmups:0, perfect:0, floorStreak:0, twCleared:0, gauntlets:0, gauntletBest:0, scripts:0},
     /* voice profile from calibration — see Audio.setProfile */
     profile:{done:false, at:null, noiseDb:null, modalHz:null, mpt:null, steadiness:null,
@@ -158,9 +158,23 @@ var S = (function(){
   }
 
   function tierUnlocked(tier){
+    if(s.prefs.demoUnlock) return true;      /* admin demo mode — every tier open */
     var l=level();
     return tier<=1 || (tier===2 && l>=4) || (tier===3 && l>=9) || (tier===4 && l>=16);
   }
+
+  /* --- admin demo helpers ------------------------------------------------
+     Level gating is a UX pacing device, not a security boundary — what
+     actually protects data is row-level security in Postgres. So setting
+     your own level locally is harmless. It still only appears for admins. */
+  function setLevel(target){
+    target=Math.max(1, Math.min(50, Math.round(target||1)));
+    s.xp = cumXp(target);
+    checkAch(); save();
+    if(window.UI && UI.paintHud) UI.paintHud();
+    return level();
+  }
+  function setDemoUnlock(on){ s.prefs.demoUnlock=!!on; save(); }
   function tierNeed(tier){ return tier<=1?1:tier===2?4:tier===3?9:16; }
 
   /* achievements */
@@ -302,6 +316,7 @@ var S = (function(){
     saveProfile:saveProfile, profile:profile, clearProfile:clearProfile, profileDrift:profileDrift,
     mergeRemote:mergeRemote,
     weakQueue:weakQueue, tierUnlocked:tierUnlocked, tierNeed:tierNeed,
+    setLevel:setLevel, setDemoUnlock:setDemoUnlock,
     grant:grant, checkAch:checkAch, noteMetric:noteMetric, stats:stats, touchDay:touchDay,
     reset:reset, exportJson:exportJson, importJson:importJson, today:today
   };

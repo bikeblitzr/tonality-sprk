@@ -47,6 +47,23 @@ An optional Supabase backend adds accounts, cross-device sync and a team dashboa
 
 ---
 
+## See how this works — the map
+
+A 3D, navigable map of the entire engine, in the rail under *Under the hood*. Roughly **960 nodes** across ten domains, split into two lobes: how a voice is physically produced and measured on one side, how a listener decodes it on the other.
+
+Two layers, merged at runtime:
+
+- an authored knowledge spine — mechanisms, figures from the phonetics and prosody literature, and the rules this app actually applies
+- every live dataset in the product, expanded into the same graph: all 72 tones with their recipe, their five target numbers and their failure mode, all 230 twisters with the phonetic reason each is hard, the 39 principles, the codex chapters, the advisor's stages, modifiers and phrasing triggers, the emphasis tables and the drill set
+
+Because the second layer is generated from the same arrays the app runs on, the map cannot drift out of date. Add a tone and it appears in the brain.
+
+Every node carries two things: **what it is**, and **how it helps you**. Click to expand into children, drag to turn, scroll to zoom, search to jump.
+
+Rendered in raw canvas 2D — hand-rolled perspective projection, depth sorting, label collision avoidance and hit testing. No WebGL library, no CDN, no dependency; it works offline and over `file://` like the rest of the app, and holds 60 fps with the full cloud on screen.
+
+---
+
 ## Calibration and the flat baseline
 
 Everyone has a different *flat* — the way they sound with no deliberate emphasis at all. A speaker whose unemphasised voice already moves 6 semitones is doing nothing special when a drill measures 6; a speaker whose flat is 1.5 has just travelled four times as far for the same number.
@@ -109,6 +126,8 @@ Promote yourself to admin once, after signing up:
 update public.profiles set role = 'admin' where email = 'you@example.com';
 ```
 
+Admin accounts get a **Demo controls** section in Settings — unlock every tier regardless of level, set your level directly, or add XP — for showing the whole app to a room without grinding to level 16 first. Level gating is pacing, not security: what actually protects data is row-level security in Postgres, which these controls do not touch. A `DEMO` badge replaces your rank in the HUD while unlock-everything is on, so a demo level is never mistaken for a real one.
+
 ## Editing it
 
 `index.html` is generated. Edit the parts in `src/` and run `node build.mjs` — files are concatenated in filename order.
@@ -124,6 +143,7 @@ src/
   14-data-codex.js      theory chapters
   15-data-power.js      psychology principles, influence reference, frame rack
   16-data-curriculum.js levels, ranks, achievements, 90-day path
+  17-data-brain.js      the authored knowledge spine behind the map
   20-audio.js           mic capture, pitch tracking, VAD, calibration, scoring
   25-cloud.js           Supabase client — auth, sync, telemetry queue, time tracking
   30-state.js           persistence, XP, mastery decay, spaced repetition, remote merge
@@ -131,6 +151,7 @@ src/
   50-drill.js           the stage — all 20 drill modes
   60-views.js           all pages
   62-views-cloud.js     account, admin dashboard, per-person drill-down
+  70-brain.js           the map — graph assembly, 3D layout, canvas renderer
   90-boot.js            boot + first-run
 
 supabase/
